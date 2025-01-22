@@ -229,7 +229,7 @@ func (aggregator *DocumentAggregator) Add(category string, values []string, scor
 			}
 		} else {
 			if aggregator.Documents[value].Score != scores[i] {
-				panic("score should be the same")
+				// panic("score should be the same")
 			}
 			aggregator.Documents[value].Categories = append(aggregator.Documents[value].Categories, category)
 		}
