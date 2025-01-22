@@ -51,6 +51,7 @@ func NewTracer(name string) *Tracer {
 func (t *Tracer) Start(ctx context.Context, name string, total int) (context.Context, *Span) {
 	span := &Span{
 		name:   name,
+		tracer: t.name,
 		status: StatusRunning,
 		total:  total,
 		start:  time.Now(),
@@ -74,6 +75,7 @@ func (t *Tracer) List() []Progress {
 }
 
 type Span struct {
+	tracer   string
 	name     string
 	status   Status
 	total    int
@@ -123,6 +125,7 @@ func (s *Span) Progress() Progress {
 	// leaf node
 	if len(children) == 0 {
 		return Progress{
+			Tracer:     s.tracer,
 			Name:       s.name,
 			Status:     s.status,
 			Error:      s.err,
@@ -140,6 +143,7 @@ func (s *Span) Progress() Progress {
 		parentCount += childTotal * child.Count / child.Total
 	}
 	return Progress{
+		Tracer:     s.tracer,
 		Name:       s.name,
 		Status:     s.status,
 		Error:      s.err,

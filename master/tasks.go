@@ -54,7 +54,7 @@ const (
 	TaskFindUserNeighbors      = "Find neighbors of users"
 	TaskFitRankingModel        = "Fit collaborative filtering model"
 	TaskFitClickModel          = "Fit click-through rate prediction model"
-	TaskSearchRankingModel     = "Search collaborative filtering  model"
+	TaskSearchRankingModel     = "Search collaborative filtering model"
 	TaskSearchClickModel       = "Search click-through rate prediction model"
 	TaskCacheGarbageCollection = "Collect garbage in cache"
 
@@ -1205,6 +1205,9 @@ func (t *SearchRankingModelTask) priority() int {
 
 func (t *SearchRankingModelTask) run(ctx context.Context, j *task.JobsAllocator) error {
 	log.Logger().Info("start searching ranking model")
+	newCtx, span := t.tracer.Start(ctx, "Search Collaborative Filtering Model", 1)
+	defer span.End()
+
 	t.rankingDataMutex.RLock()
 	defer t.rankingDataMutex.RUnlock()
 	if t.rankingTrainSet == nil {
@@ -1228,7 +1231,7 @@ func (t *SearchRankingModelTask) run(ctx context.Context, j *task.JobsAllocator)
 	}
 
 	startTime := time.Now()
-	err := t.rankingModelSearcher.Fit(ctx, t.rankingTrainSet, t.rankingTestSet, nil)
+	err := t.rankingModelSearcher.Fit(newCtx, t.rankingTrainSet, t.rankingTestSet, nil)
 	if err != nil {
 		log.Logger().Error("failed to search collaborative filtering model", zap.Error(err))
 		return nil
@@ -1266,6 +1269,10 @@ func (t *SearchClickModelTask) priority() int {
 
 func (t *SearchClickModelTask) run(ctx context.Context, j *task.JobsAllocator) error {
 	log.Logger().Info("start searching click model")
+
+	newCtx, span := t.tracer.Start(ctx, "Search Click-Through Rate Prediction Model", 1)
+	defer span.End()
+
 	t.clickDataMutex.RLock()
 	defer t.clickDataMutex.RUnlock()
 	if t.clickTrainSet == nil {
@@ -1288,7 +1295,7 @@ func (t *SearchClickModelTask) run(ctx context.Context, j *task.JobsAllocator) e
 	}
 
 	startTime := time.Now()
-	err := t.clickModelSearcher.Fit(context.Background(), t.clickTrainSet, t.clickTestSet, j)
+	err := t.clickModelSearcher.Fit(newCtx, t.clickTrainSet, t.clickTestSet, j)
 	if err != nil {
 		log.Logger().Error("failed to search ranking model", zap.Error(err))
 		return nil

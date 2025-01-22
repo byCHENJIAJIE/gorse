@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/ReneKroon/ttlcache/v2"
+	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/emicklei/go-restful/v3"
 	"github.com/juju/errors"
 	"github.com/zhenghaoz/gorse/base"
@@ -476,4 +477,16 @@ func (m *Master) notifyDataImported() {
 	if err != nil {
 		log.Logger().Error("failed to write meta", zap.Error(err))
 	}
+}
+
+func (m *Master) GetNodes() mapset.Set[string] {
+	nodes := mapset.NewSet[string]()
+	m.nodesInfoMutex.RLock()
+	for _, info := range m.nodesInfo {
+		if info.Type == WorkerNode || info.Type == ServerNode {
+			nodes.Add(info.Name)
+		}
+	}
+	m.nodesInfoMutex.RUnlock()
+	return nodes
 }

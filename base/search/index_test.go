@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/zhenghaoz/gorse/base/progress"
 	"github.com/zhenghaoz/gorse/base/task"
 	"github.com/zhenghaoz/gorse/model"
 	"github.com/zhenghaoz/gorse/model/ranking"
@@ -51,7 +52,7 @@ func TestHNSW_InnerProduct(t *testing.T) {
 
 	// build vector index
 	builder := NewHNSWBuilder(vectors, 10, runtime.NumCPU())
-	idx, recall := builder.Build(context.Background(), 0.9, 5, false)
+	idx, recall := builder.Build(context.Background(), progress.NewTracer("test"), 0.9, 5, false)
 	assert.Greater(t, recall, float32(0.9))
 	recall = builder.evaluateTermSearch(idx, true, "prime")
 	assert.Greater(t, recall, float32(0.8))

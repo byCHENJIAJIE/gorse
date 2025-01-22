@@ -471,7 +471,7 @@ func (w *Worker) Recommend(users []data.User) {
 
 	// progress tracker
 	completed := make(chan struct{}, 1000)
-	_, span := w.tracer.Start(context.Background(), "Recommend", len(users))
+	_, span := w.tracer.Start(context.Background(), "Offline Recommend ("+w.workerName+")", len(users))
 	defer span.End()
 
 	go func() {
@@ -497,7 +497,12 @@ func (w *Worker) Recommend(users []data.User) {
 						zap.Int("n_working_users", len(users)),
 						zap.Int("throughput", throughput))
 				}
-				if _, err := w.masterClient.PushProgress(context.Background(), protocol.EncodeProgress(w.tracer.List())); err != nil {
+				progress := w.tracer.List()
+				for i := range progress {
+					progress[i].Tracer = w.workerName
+				}
+
+				if _, err := w.masterClient.PushProgress(context.Background(), protocol.EncodeProgress(progress)); err != nil {
 					log.Logger().Error("failed to report update task", zap.Error(err))
 				}
 			}
@@ -521,7 +526,7 @@ func (w *Worker) Recommend(users []data.User) {
 			}
 			builder := search.NewHNSWBuilder(vectors, w.Config.Recommend.CacheSize, w.jobs)
 			var recall float32
-			w.rankingIndex, recall = builder.Build(ctx, w.Config.Recommend.Collaborative.IndexRecall,
+			w.rankingIndex, recall = builder.Build(ctx, w.tracer, w.Config.Recommend.Collaborative.IndexRecall,
 				w.Config.Recommend.Collaborative.IndexFitEpoch, false)
 			CollaborativeFilteringIndexRecall.Set(float64(recall))
 			if err = w.CacheClient.Set(ctx, cache.String(cache.Key(cache.GlobalMeta, cache.MatchingIndexRecall), encoding.FormatFloat32(recall))); err != nil {

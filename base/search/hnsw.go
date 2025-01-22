@@ -372,9 +372,9 @@ func (b *HNSWBuilder) evaluate(idx *HNSW, prune0 bool) float32 {
 	return result / count
 }
 
-func (b *HNSWBuilder) Build(ctx context.Context, recall float32, trials int, prune0 bool) (idx *HNSW, score float32) {
+func (b *HNSWBuilder) Build(ctx context.Context, tracer *progress.Tracer, recall float32, trials int, prune0 bool) (idx *HNSW, score float32) {
 	ef := 1 << int(math32.Ceil(math32.Log2(float32(b.k))))
-	newCtx, span := progress.Start(ctx, "HNSWBuilder.Build", trials)
+	newCtx, span := tracer.Start(ctx, "HNSWBuilder.Build", trials)
 	defer span.End()
 	for i := 0; i < trials; i++ {
 		start := time.Now()

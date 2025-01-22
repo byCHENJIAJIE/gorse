@@ -638,20 +638,13 @@ func (m *Master) getStats(request *restful.Request, response *restful.Response) 
 }
 
 func (m *Master) getTasks(_ *restful.Request, response *restful.Response) {
-	// List workers
-	workers := mapset.NewSet[string]()
-	m.nodesInfoMutex.RLock()
-	for _, info := range m.nodesInfo {
-		if info.Type == WorkerNode {
-			workers.Add(info.Name)
-		}
-	}
-	m.nodesInfoMutex.RUnlock()
+	// List nodes
+	nodes := m.GetNodes()
 	// List local progress
 	progressList := m.tracer.List()
 	// list remote progress
 	m.remoteProgress.Range(func(key, value interface{}) bool {
-		if workers.Contains(key.(string)) {
+		if nodes.Contains(key.(string)) {
 			progressList = append(progressList, value.([]progress.Progress)...)
 		}
 		return true
