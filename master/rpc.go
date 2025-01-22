@@ -25,6 +25,7 @@ import (
 	"github.com/zhenghaoz/gorse/model/click"
 	"github.com/zhenghaoz/gorse/model/ranking"
 	"github.com/zhenghaoz/gorse/protocol"
+	"github.com/zhenghaoz/gorse/storage/cache"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/peer"
 )
@@ -250,4 +251,26 @@ func (m *Master) PushProgress(
 	// store progress
 	m.remoteProgress.Store(tracer, protocol.DecodeProgress(in))
 	return &protocol.PushProgressResponse{}, nil
+}
+
+func (m *Master) GetNeighborsStatus(ctx context.Context, _ *protocol.Empty) (*protocol.NeighborsStatus, error) {
+	status := &protocol.NeighborsStatus{}
+
+	// 检查 item neighbors 状态
+	itemNeighborsTime, err := m.CacheClient.Get(ctx, cache.Key(cache.GlobalMeta, cache.LastUpdateItemNeighborsTime)).Time()
+	if err == nil {
+		status.ItemNeighborsFinished = true
+		// 获取版本号，可以用时间戳作为版本
+		status.ItemNeighborsVersion = itemNeighborsTime.Unix()
+	}
+
+	// 检查 user neighbors 状态
+	userNeighborsTime, err := m.CacheClient.Get(ctx, cache.Key(cache.GlobalMeta, cache.LastUpdateUserNeighborsTime)).Time()
+	if err == nil {
+		status.UserNeighborsFinished = true
+		// 获取版本号，可以用时间戳作为版本
+		status.UserNeighborsVersion = userNeighborsTime.Unix()
+	}
+
+	return status, nil
 }

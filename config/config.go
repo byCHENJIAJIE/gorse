@@ -96,6 +96,7 @@ type ServerConfig struct {
 	AutoInsertUser bool          `mapstructure:"auto_insert_user"`             // insert new users while inserting feedback
 	AutoInsertItem bool          `mapstructure:"auto_insert_item"`             // insert new items while inserting feedback
 	CacheExpire    time.Duration `mapstructure:"cache_expire" validate:"gt=0"` // server-side cache expire time
+	NumJobs        int           `mapstructure:"n_jobs" validate:"gt=0"`       // number of working jobs
 }
 
 // RecommendConfig is the configuration of recommendation setup.
@@ -197,6 +198,7 @@ func GetDefaultConfig() *Config {
 			AutoInsertUser: true,
 			AutoInsertItem: true,
 			CacheExpire:    10 * time.Second,
+			NumJobs:        1,
 		},
 		Recommend: RecommendConfig{
 			CacheSize:   100,
@@ -484,6 +486,7 @@ func setDefault() {
 	viper.SetDefault("server.auto_insert_user", defaultConfig.Server.AutoInsertUser)
 	viper.SetDefault("server.auto_insert_item", defaultConfig.Server.AutoInsertItem)
 	viper.SetDefault("server.cache_expire", defaultConfig.Server.CacheExpire)
+	viper.SetDefault("server.n_jobs", defaultConfig.Server.NumJobs)
 	// [recommend]
 	viper.SetDefault("recommend.cache_size", defaultConfig.Recommend.CacheSize)
 	viper.SetDefault("recommend.cache_expire", defaultConfig.Recommend.CacheExpire)

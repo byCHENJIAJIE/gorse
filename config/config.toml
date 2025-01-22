@@ -83,6 +83,9 @@ auto_insert_item = true
 # Server-side cache expire time. The default value is 10s.
 cache_expire = "10s"
 
+# Number of working jobs in the server node. The default value is 1.
+n_jobs = 4
+
 [recommend]
 
 # The cache size for recommended/popular/latest items. The default value is 10.

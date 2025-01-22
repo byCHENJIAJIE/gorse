@@ -34,6 +34,8 @@ service Master {
 
   rpc PushProgress(PushProgressRequest) returns (PushProgressResponse) {}
 
+  /* check neighbors status */
+  rpc GetNeighborsStatus(Empty) returns (NeighborsStatus) {}
 }
 
 message Meta {
@@ -76,3 +78,12 @@ message PushProgressRequest {
 }
 
 message PushProgressResponse {}
+
+message Empty {}
+
+message NeighborsStatus {
+  bool item_neighbors_finished = 1;
+  bool user_neighbors_finished = 2;
+  int64 item_neighbors_version = 3;
+  int64 user_neighbors_version = 4;
+}

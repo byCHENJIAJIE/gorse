@@ -150,6 +150,7 @@ func NewMaster(cfg *config.Config, cacheFile string, managedMode bool) *Master {
 			HttpHost:   cfg.Master.HttpHost,
 			HttpPort:   cfg.Master.HttpPort,
 			WebService: new(restful.WebService),
+			IsMaster:   true,
 		},
 		fitTicker:    time.NewTicker(cfg.Recommend.Collaborative.ModelFitPeriod),
 		importedChan: parallel.NewConditionChannel(),

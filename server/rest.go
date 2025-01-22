@@ -18,11 +18,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/pprof"
+	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/araddon/dateparse"
 	mapset "github.com/deckarep/golang-set/v2"
@@ -30,15 +34,21 @@ import (
 	"github.com/emicklei/go-restful/v3"
 	"github.com/google/uuid"
 	"github.com/juju/errors"
+	cmap "github.com/orcaman/concurrent-map"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/samber/lo"
 	"github.com/thoas/go-funk"
+	"github.com/zhenghaoz/gorse/base/encoding"
 	"github.com/zhenghaoz/gorse/base/heap"
 	"github.com/zhenghaoz/gorse/base/log"
+	"github.com/zhenghaoz/gorse/base/search"
 	"github.com/zhenghaoz/gorse/config"
+	"github.com/zhenghaoz/gorse/model/click"
+	"github.com/zhenghaoz/gorse/protocol"
 	"github.com/zhenghaoz/gorse/storage/cache"
 	"github.com/zhenghaoz/gorse/storage/data"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/emicklei/go-restful/otelrestful"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 	"modernc.org/mathutil"
@@ -52,6 +62,7 @@ const (
 	RecommendationAPITag = "recommendation"
 	MeasurementsAPITag   = "measurements"
 	DetractedAPITag      = "deprecated"
+	batchSize            = 10000
 )
 
 // RestServer implements a REST-ful API server.
@@ -64,10 +75,49 @@ type RestServer struct {
 	DisableLog bool
 	WebService *restful.WebService
 	HttpServer *http.Server
+
+	IsMaster bool
+
+	Server *Server
+
+	// 添加全局 itemCache
+	itemCache     *ItemCache
+	itemCacheLock sync.RWMutex
+
+	// 添加全局 feedbackCache
+	feedbackCache *FeedbackCache
+
+	// 添加内存缓存
+	cacheLock            sync.RWMutex
+	popularItems         map[string][]cache.Document // 热门物品缓存,key为分类
+	latestItems          map[string][]cache.Document // 最新物品缓存,key为分类
+	itemNeighbors        map[string][]cache.Document // 物品邻居缓存,key为itemId
+	userNeighbors        map[string][]cache.Document // 用户邻居缓存,key为userId
+	itemNeighborsVersion int64
+	userNeighborsVersion int64
+}
+
+func (s *RestServer) SetServer(server *Server) {
+	s.Server = server
 }
 
 // StartHttpServer starts the REST-ful API server.
 func (s *RestServer) StartHttpServer(container *restful.Container) {
+	if !s.IsMaster {
+		// 初始化 itemCache 和 feedbackCache
+		if err := s.initItemCache(context.Background()); err != nil {
+			log.Logger().Fatal("failed to initialize item cache", zap.Error(err))
+		}
+		s.feedbackCache = NewFeedbackCache(s, s.Config.Recommend.DataSource.PositiveFeedbackTypes...)
+
+		// 初始化内存缓存
+		if err := s.initCache(context.Background()); err != nil {
+			log.Logger().Fatal("failed to initialize memory cache", zap.Error(err))
+		}
+
+		// go s.reportCacheSize(context.Background())
+	}
+
 	// register restful APIs
 	s.CreateWebService()
 	container.Add(s.WebService)
@@ -311,8 +361,10 @@ func (s *RestServer) CreateWebService() {
 		Returns(http.StatusOK, "OK", Success{}).
 		Writes(Success{}))
 	// Insert feedback
-	ws.Route(ws.POST("/feedback").To(s.insertFeedback(false)).
-		Doc("Insert feedbacks. Ignore insertion if feedback exists.").
+	// ws.Route(ws.POST("/feedback").To(s.insertFeedback(false)).
+	// Doc("Insert feedbacks. Ignore insertion if feedback exists.").
+	ws.Route(ws.POST("/feedback").To(s.insertFeedback(true)).
+		Doc("Insert feedbacks. Existed feedback will be overwritten.").
 		Metadata(restfulspec.KeyOpenAPITags, []string{FeedbackAPITag}).
 		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
 		Reads([]data.Feedback{}).
@@ -729,14 +781,16 @@ func (s *RestServer) Recommend(ctx context.Context, response *restful.Response, 
 	}
 	totalTime := time.Since(initStart)
 	log.ResponseLogger(response).Info("complete recommendation",
-		zap.Int("num_from_final", recommendCtx.numFromOffline),
+		zap.Int("num_from_online", recommendCtx.numFromOnline),
+		zap.Int("num_from_offline", recommendCtx.numFromOffline),
 		zap.Int("num_from_collaborative", recommendCtx.numFromCollaborative),
 		zap.Int("num_from_item_based", recommendCtx.numFromItemBased),
 		zap.Int("num_from_user_based", recommendCtx.numFromUserBased),
 		zap.Int("num_from_latest", recommendCtx.numFromLatest),
 		zap.Int("num_from_poplar", recommendCtx.numFromPopular),
 		zap.Duration("total_time", totalTime),
-		zap.Duration("load_final_recommend_time", recommendCtx.loadOfflineRecTime),
+		zap.Duration("load_online_recommend_time", recommendCtx.loadOnlineRecTime),
+		zap.Duration("load_offline_recommend_time", recommendCtx.loadOfflineRecTime),
 		zap.Duration("load_col_recommend_time", recommendCtx.loadColRecTime),
 		zap.Duration("load_hist_time", recommendCtx.loadLoadHistTime),
 		zap.Duration("item_based_recommend_time", recommendCtx.itemBasedTime),
@@ -762,8 +816,10 @@ type recommendContext struct {
 	numFromItemBased     int
 	numFromCollaborative int
 	numFromOffline       int
+	numFromOnline        int
 
 	loadOfflineRecTime time.Duration
+	loadOnlineRecTime  time.Duration
 	loadColRecTime     time.Duration
 	loadLoadHistTime   time.Duration
 	itemBasedTime      time.Duration
@@ -774,10 +830,12 @@ type recommendContext struct {
 
 func (s *RestServer) createRecommendContext(ctx context.Context, userId string, categories []string, n int) (*recommendContext, error) {
 	// pull historical feedback
-	userFeedback, err := s.DataClient.GetUserFeedback(ctx, userId, s.Config.Now())
+	startTime := time.Now()
+	userFeedback, err := s.feedbackCache.GetUserFeedback(ctx, userId)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	log.Logger().Info("TimeUse: GetUserFeedback", zap.String("user_id", userId), zap.Duration("get_user_feedback_time", time.Since(startTime)))
 	excludeSet := mapset.NewSet[string]()
 	for _, item := range userFeedback {
 		if !s.Config.Recommend.Replacement.EnableReplacement {
@@ -796,7 +854,833 @@ func (s *RestServer) createRecommendContext(ctx context.Context, userId string, 
 
 type Recommender func(ctx *recommendContext) error
 
+func (s *RestServer) RecommendOnline(ctx *recommendContext) error {
+	log.Logger().Debug("start online recommendation")
+	start := time.Now()
+
+	// 使用全局 itemCache
+	s.itemCacheLock.RLock()
+	itemCache := s.itemCache
+	s.itemCacheLock.RUnlock()
+
+	// 现在user的label是空的，不需要查数据库
+	// user, err := s.DataClient.GetUser(ctx.context, ctx.userId)
+	user := data.User{
+		UserId: ctx.userId,
+		Labels: []string{},
+	}
+	userId := ctx.userId
+
+	var (
+		collaborativeRecommendSeconds atomic.Float64
+		userBasedRecommendSeconds     atomic.Float64
+		itemBasedRecommendSeconds     atomic.Float64
+		latestRecommendSeconds        atomic.Float64
+		popularRecommendSeconds       atomic.Float64
+		historyItems                  []string
+		positiveItems                 []string
+		excludeSet                    mapset.Set[string]
+	)
+
+	// 并发处理，创建错误通道和结果通道
+	errChan := make(chan error, 5)
+	candidatesChan := make(chan map[string][][]string, 5)
+	var wg sync.WaitGroup
+
+	// load historical and positive items
+	// wg.Add(1)
+	// go func() {
+	// 	defer wg.Done()
+	loadUserHistoricalItemsStart := time.Now()
+	for _, feedback := range ctx.userFeedback {
+		historyItems = append(historyItems, feedback.ItemId)
+	}
+	excludeSet = mapset.NewSet(historyItems...)
+	log.Logger().Debug("TimeUse: load user historical items", zap.String("user_id", userId), zap.Duration("load_user_historical_items_time", time.Since(loadUserHistoricalItemsStart)))
+
+	loadPositiveItemsStart := time.Now()
+	if s.Config.Recommend.Offline.EnableItemBasedRecommend {
+		for _, feedback := range ctx.userFeedback {
+			if funk.ContainsString(s.Config.Recommend.DataSource.PositiveFeedbackTypes, feedback.FeedbackType) {
+				positiveItems = append(positiveItems, feedback.ItemId)
+			}
+		}
+	}
+	log.Logger().Debug("TimeUse: load positive items", zap.String("user_id", userId), zap.Duration("load_positive_items_time", time.Since(loadPositiveItemsStart)))
+	// candidatesChan <- nil
+	// }()
+
+	// Recommender #1: collaborative filtering.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		collaborativeRecommendStart := time.Now()
+		defer func() {
+			log.Logger().Debug("TimeUse: collaborative filtering", zap.String("user_id", userId), zap.Duration("collaborative_filtering_time", time.Since(collaborativeRecommendStart)))
+		}()
+		if s.Config.Recommend.Offline.EnableColRecommend && s.RankingModel != nil && !s.RankingModel.Invalid() {
+			if userIndex := s.RankingModel.GetUserIndex().ToNumber(userId); s.RankingModel.IsUserPredictable(userIndex) {
+				var recommend map[string][]string
+				var usedTime time.Duration
+				var err error
+				if s.Config.Recommend.Collaborative.EnableIndex && s.Server.rankingIndex != nil {
+					log.Logger().Debug("use hnsw", zap.String("user_id", userId))
+					recommend, usedTime, err = s.collaborativeRecommendHNSW(s.Server.rankingIndex, userId, ctx.categories, excludeSet, itemCache)
+				} else {
+					log.Logger().Debug("use brute force", zap.String("user_id", userId))
+					recommend, usedTime, err = s.collaborativeRecommendBruteForce(userId, ctx.categories, excludeSet, itemCache)
+				}
+				if err != nil {
+					log.Logger().Error("failed to recommend by collaborative filtering",
+						zap.String("user_id", userId), zap.Error(err))
+					errChan <- err
+					return
+				}
+				candidates := make(map[string][][]string)
+				for category, items := range recommend {
+					candidates[category] = append(candidates[category], items)
+				}
+				collaborativeRecommendSeconds.Add(usedTime.Seconds())
+				candidatesChan <- candidates
+				return
+			} else if !s.RankingModel.IsUserPredictable(userIndex) {
+				log.Logger().Info("user is unpredictable", zap.String("user_id", userId))
+			} else {
+				log.Logger().Error("user is not in the model", zap.String("user_id", userId))
+			}
+		} else if s.RankingModel == nil || s.RankingModel.Invalid() {
+			log.Logger().Info("no collaborative filtering model")
+		}
+		candidatesChan <- nil
+	}()
+
+	// Recommender #2: item-based.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		itemBasedRecommendStart := time.Now()
+		defer func() {
+			log.Logger().Debug("TimeUse: item-based", zap.String("user_id", userId), zap.Duration("item_based_recommend_time", time.Since(itemBasedRecommendStart)))
+		}()
+		if s.Config.Recommend.Offline.EnableItemBasedRecommend {
+			candidates := make(map[string][][]string)
+			localStartTime := time.Now()
+			for _, category := range ctx.categories {
+				// collect candidates
+				scores := make(map[string]float64)
+				for _, itemId := range positiveItems {
+					// load similar items
+					similarItems, err := s.GetItemNeighbors(itemId, category)
+					if err != nil {
+						log.Logger().Error("failed to load similar items", zap.Error(err))
+						errChan <- err
+						return
+					}
+					// add unseen items
+					for _, item := range similarItems {
+						if !excludeSet.Contains(item.Id) && itemCache.IsAvailable(item.Id) {
+							scores[item.Id] += item.Score
+						}
+					}
+				}
+				// collect top k
+				filter := heap.NewTopKFilter[string, float64](s.Config.Recommend.CacheSize)
+				for id, score := range scores {
+					filter.Push(id, score)
+				}
+				ids, _ := filter.PopAll()
+				candidates[category] = append(candidates[category], ids)
+			}
+			itemBasedRecommendSeconds.Add(time.Since(localStartTime).Seconds())
+			candidatesChan <- candidates
+			return
+		}
+		candidatesChan <- nil
+	}()
+
+	// Recommender #3: insert user-based items
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		userBasedRecommendStart := time.Now()
+		defer func() {
+			log.Logger().Debug("TimeUse: user-based", zap.String("user_id", userId), zap.Duration("user_based_recommend_time", time.Since(userBasedRecommendStart)))
+		}()
+		if s.Config.Recommend.Offline.EnableUserBasedRecommend {
+			candidates := make(map[string][][]string)
+			localStartTime := time.Now()
+			scores := make(map[string]float64)
+			// load similar users
+			similarUsers, err := s.GetUserNeighbors(userId)
+			if err != nil {
+				log.Logger().Error("failed to load similar users", zap.Error(err))
+				errChan <- err
+				return
+			}
+			// FIXME 这里很花时间，有上百毫秒，瓶颈在这里
+			for _, user := range similarUsers {
+				// load similar user's historical feedback
+				similarUserFeedbacks, err := s.feedbackCache.GetUserPositiveFeedback(ctx.context, user.Id)
+				if err != nil {
+					log.Logger().Error("failed to pull user feedback",
+						zap.String("user_id", userId), zap.Error(err))
+					errChan <- err
+					return
+				}
+				// add unseen items
+				for _, f := range similarUserFeedbacks {
+					if !excludeSet.Contains(f.ItemId) && itemCache.IsAvailable(f.ItemId) {
+						scores[f.ItemId] += user.Score
+					}
+				}
+			}
+			// collect top k
+			filters := make(map[string]*heap.TopKFilter[string, float64])
+			for _, category := range ctx.categories {
+				filters[category] = heap.NewTopKFilter[string, float64](s.Config.Recommend.CacheSize)
+			}
+			for id, score := range scores {
+				for _, category := range itemCache.GetCategory(id) {
+					if filter, ok := filters[category]; ok {
+						filter.Push(id, score)
+					}
+				}
+			}
+			for category, filter := range filters {
+				ids, _ := filter.PopAll()
+				candidates[category] = append(candidates[category], ids)
+			}
+			userBasedRecommendSeconds.Add(time.Since(localStartTime).Seconds())
+			candidatesChan <- candidates
+			return
+		}
+		candidatesChan <- nil
+	}()
+
+	// Recommender #4: latest items.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		latestRecommendStart := time.Now()
+		defer func() {
+			log.Logger().Debug("TimeUse: latest", zap.String("user_id", userId), zap.Duration("latest_recommend_time", time.Since(latestRecommendStart)))
+		}()
+		if s.Config.Recommend.Offline.EnableLatestRecommend {
+			candidates := make(map[string][][]string)
+			localStartTime := time.Now()
+			for _, category := range ctx.categories {
+				latestItems := s.GetLatestItems(category)
+				var recommend []string
+				for _, latestItem := range latestItems {
+					if !excludeSet.Contains(latestItem.Id) && itemCache.IsAvailable(latestItem.Id) {
+						recommend = append(recommend, latestItem.Id)
+					}
+				}
+				candidates[category] = append(candidates[category], recommend)
+			}
+			latestRecommendSeconds.Add(time.Since(localStartTime).Seconds())
+			candidatesChan <- candidates
+			return
+		}
+		candidatesChan <- nil
+	}()
+
+	// Recommender #5: popular items.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		popularRecommendStart := time.Now()
+		defer func() {
+			log.Logger().Debug("TimeUse: popular", zap.String("user_id", userId), zap.Duration("popular_recommend_time", time.Since(popularRecommendStart)))
+		}()
+		if s.Config.Recommend.Offline.EnablePopularRecommend {
+			candidates := make(map[string][][]string)
+			localStartTime := time.Now()
+			for _, category := range ctx.categories {
+				popularItems := s.GetPopularItems(category)
+				var recommend []string
+				for _, popularItem := range popularItems {
+					if !excludeSet.Contains(popularItem.Id) && itemCache.IsAvailable(popularItem.Id) {
+						recommend = append(recommend, popularItem.Id)
+					}
+				}
+				candidates[category] = append(candidates[category], recommend)
+			}
+			popularRecommendSeconds.Add(time.Since(localStartTime).Seconds())
+			candidatesChan <- candidates
+			return
+		}
+		candidatesChan <- nil
+	}()
+
+	// 等待所有goroutine完成并收集结果
+	go func() {
+		wg.Wait()
+		close(errChan)
+		close(candidatesChan)
+	}()
+
+	// 检查错误
+	for err := range errChan {
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+
+	// 合并所有候选结果
+	allCandidates := make(map[string][][]string)
+	for candidates := range candidatesChan {
+		for category, items := range candidates {
+			allCandidates[category] = append(allCandidates[category], items...)
+		}
+	}
+
+	// rank items from different recommenders
+	// 1. If click-through rate prediction model is available, use it to rank items.
+	// 2. If collaborative filtering model is available, use it to rank items.
+	// 3. Otherwise, merge all recommenders' results randomly.
+	// ctrUsed := false
+	rankItemsStart := time.Now()
+	results := make(map[string][]cache.Document)
+	for category, catCandidates := range allCandidates {
+		ranker := click.Spawn(s.ClickModel)
+		var err error
+		if s.Config.Recommend.Offline.EnableClickThroughPrediction && ranker != nil && !ranker.Invalid() {
+			results[category], err = s.rankByClickTroughRate(&user, catCandidates, itemCache, ranker)
+		} else if s.RankingModel != nil && !s.RankingModel.Invalid() &&
+			s.RankingModel.IsUserPredictable(s.RankingModel.GetUserIndex().ToNumber(userId)) {
+			results[category], err = s.rankByCollaborativeFiltering(userId, catCandidates)
+		} else {
+			results[category] = s.mergeAndShuffle(catCandidates)
+		}
+		if err != nil {
+			log.Logger().Error("failed to rank items", zap.Error(err))
+			return errors.Trace(err)
+		}
+	}
+	log.Logger().Debug("TimeUse: rank items", zap.String("user_id", userId), zap.Duration("rank_items_time", time.Since(rankItemsStart)))
+
+	// replacement
+	replacementStart := time.Now()
+	if s.Config.Recommend.Replacement.EnableReplacement {
+		var err error
+		if results, err = s.replacement(results, &user, historyItems, positiveItems, itemCache); err != nil {
+			log.Logger().Error("failed to replace items", zap.Error(err))
+			return errors.Trace(err)
+		}
+	}
+	log.Logger().Debug("TimeUse: replacement", zap.String("user_id", userId), zap.Duration("replacement_time", time.Since(replacementStart)))
+
+	// explore latest and popular
+	exploreStart := time.Now()
+	for category, result := range results {
+		// 每个category只需要w.Config.Recommend.CacheSize个items
+		if len(result) > s.Config.Recommend.CacheSize {
+			result = result[:s.Config.Recommend.CacheSize]
+		}
+		scores, err := s.exploreRecommend(result, excludeSet, category)
+		if err != nil {
+			log.Logger().Error("failed to explore latest and popular items", zap.Error(err))
+			return errors.Trace(err)
+		}
+
+		for _, item := range scores {
+			if !ctx.excludeSet.Contains(item.Id) {
+				ctx.results = append(ctx.results, item.Id)
+				ctx.excludeSet.Add(item.Id)
+			}
+		}
+		ctx.loadOnlineRecTime = time.Since(start)
+		ctx.numFromOnline = len(ctx.results) - ctx.numPrevStage
+		ctx.numPrevStage = len(ctx.results)
+	}
+	log.Logger().Debug("TimeUse: explore", zap.String("user_id", userId), zap.Duration("explore_time", time.Since(exploreStart)))
+
+	return nil
+}
+
+func (s *RestServer) pullItems(ctx context.Context) (*ItemCache, []string, error) {
+	// pull items from database
+	itemCache := NewItemCache()
+	itemCategories := mapset.NewSet[string]()
+	itemChan, errChan := s.DataClient.GetItemStream(ctx, batchSize, nil)
+	for batchItems := range itemChan {
+		for _, item := range batchItems {
+			itemCache.Set(item.ItemId, item)
+			itemCategories.Append(item.Categories...)
+		}
+	}
+	if err := <-errChan; err != nil {
+		return nil, nil, errors.Trace(err)
+	}
+	return itemCache, itemCategories.ToSlice(), nil
+}
+
+// ItemCache is alias of map[string]data.Item.
+type ItemCache struct {
+	Data      map[string]*data.Item
+	ByteCount uintptr
+}
+
+func NewItemCache() *ItemCache {
+	return &ItemCache{Data: make(map[string]*data.Item)}
+}
+
+func (c *ItemCache) Len() int {
+	return len(c.Data)
+}
+
+func (c *ItemCache) Set(itemId string, item data.Item) {
+	if _, exist := c.Data[itemId]; !exist {
+		c.Data[itemId] = &data.Item{
+			ItemId:     item.ItemId,
+			IsHidden:   item.IsHidden,
+			Categories: item.Categories,
+			Timestamp:  item.Timestamp,
+			Labels:     item.Labels,
+		}
+	}
+}
+
+func (c *ItemCache) Get(itemId string) (*data.Item, bool) {
+	item, exist := c.Data[itemId]
+	return item, exist
+}
+
+func (c *ItemCache) GetCategory(itemId string) []string {
+	if item, exist := c.Data[itemId]; exist {
+		return item.Categories
+	} else {
+		return nil
+	}
+}
+
+// IsAvailable means the item exists in database and is not hidden.
+func (c *ItemCache) IsAvailable(itemId string) bool {
+	if item, exist := c.Data[itemId]; exist {
+		return !item.IsHidden
+	} else {
+		return false
+	}
+}
+
+func (c *ItemCache) Bytes() int {
+	return int(c.ByteCount)
+}
+
+// FeedbackCache is the cache for user feedbacks.
+type FeedbackCache struct {
+	*config.Config
+	Client        data.Database
+	PositiveTypes []string
+	Cache         cmap.ConcurrentMap
+	PositiveCache cmap.ConcurrentMap
+	ByteCount     uintptr
+}
+
+// NewFeedbackCache creates a new FeedbackCache.
+func NewFeedbackCache(s *RestServer, positiveFeedbackTypes ...string) *FeedbackCache {
+	return &FeedbackCache{
+		Config:        s.Config,
+		Client:        s.DataClient,
+		PositiveTypes: positiveFeedbackTypes,
+		Cache:         cmap.New(),
+		PositiveCache: cmap.New(),
+	}
+}
+
+// GetUserFeedback gets user feedback from cache or database.
+func (c *FeedbackCache) GetUserFeedback(ctx context.Context, userId string) ([]data.Feedback, error) {
+	cache := c.Cache
+	if tmp, ok := cache.Get(userId); ok {
+		// log.Logger().Info("TimeUse: GetUserFeedback from cache", zap.String("user_id", userId))
+		return tmp.([]data.Feedback), nil
+	} else {
+		startTime := time.Now()
+		items := make([]data.Feedback, 0)
+		feedbacks, err := c.Client.GetUserFeedback(ctx, userId, c.Config.Now())
+		if err != nil {
+			return nil, err
+		}
+		log.Logger().Info("TimeUse: GetUserFeedback from database", zap.String("user_id", userId), zap.Duration("database_time", time.Since(startTime)))
+		for _, feedback := range feedbacks {
+			items = append(items, data.Feedback{FeedbackKey: data.FeedbackKey{ItemId: feedback.ItemId, FeedbackType: feedback.FeedbackType}})
+		}
+		// 缓存test
+		// cache.Set(userId, items)
+		return items, nil
+	}
+}
+
+// GetUserPositiveFeedback gets user positive feedback from cache or database.
+func (c *FeedbackCache) GetUserPositiveFeedback(ctx context.Context, userId string) ([]data.Feedback, error) {
+	cache := c.PositiveCache
+	if tmp, ok := cache.Get(userId); ok {
+		// log.Logger().Info("TimeUse: GetUserFeedback from cache", zap.String("user_id", userId))
+		return tmp.([]data.Feedback), nil
+	} else {
+		startTime := time.Now()
+		items := make([]data.Feedback, 0)
+		feedbacks, err := c.Client.GetUserFeedback(ctx, userId, c.Config.Now(), c.PositiveTypes...)
+		if err != nil {
+			return nil, err
+		}
+		log.Logger().Info("TimeUse: GetUserPositiveFeedback from database", zap.String("user_id", userId), zap.Duration("database_time", time.Since(startTime)))
+		for _, feedback := range feedbacks {
+			items = append(items, data.Feedback{FeedbackKey: data.FeedbackKey{ItemId: feedback.ItemId, FeedbackType: feedback.FeedbackType}})
+		}
+		cache.Set(userId, items)
+		return items, nil
+	}
+}
+
+// InsertFeedback inserts feedback to cache and database.
+func (c *FeedbackCache) InsertFeedback(ctx context.Context, feedback []data.Feedback, overwrite bool) error {
+	// insert feedback to database
+	err := c.Client.BatchInsertFeedback(ctx, feedback,
+		c.Config.Server.AutoInsertUser,
+		c.Config.Server.AutoInsertItem, overwrite)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	// append feedback to cache
+	for _, f := range feedback {
+		nf := data.Feedback{FeedbackKey: data.FeedbackKey{ItemId: f.ItemId, FeedbackType: f.FeedbackType}}
+		// 缓存中没有这个用户的feedback，则无需处理
+		if existingFeedback, exists := c.Cache.Get(f.UserId); exists {
+			feedbacks := existingFeedback.([]data.Feedback)
+			// 检查feedback是否已存在
+			found := false
+			for _, ef := range feedbacks {
+				if ef.ItemId == f.ItemId && ef.FeedbackType == f.FeedbackType {
+					found = true
+					if overwrite {
+						// 如果需要覆盖,则更新现有的feedback
+						ef = nf
+					}
+					break
+				}
+			}
+			// 如果feedback不存在,则追加
+			if !found {
+				feedbacks = append(feedbacks, nf)
+				// 缓存test
+				// c.Cache.Set(f.UserId, feedbacks)
+			}
+		}
+		// 正反馈处理
+		if funk.ContainsString(c.Config.Recommend.DataSource.PositiveFeedbackTypes, f.FeedbackType) {
+			if existingFeedback, exists := c.PositiveCache.Get(f.UserId); exists {
+				feedbacks := existingFeedback.([]data.Feedback)
+				// 检查feedback是否已存在
+				found := false
+				for _, ef := range feedbacks {
+					if ef.ItemId == f.ItemId && ef.FeedbackType == f.FeedbackType {
+						found = true
+						if overwrite {
+							// 如果需要覆盖,则更新现有的feedback
+							ef = nf
+						}
+						break
+					}
+				}
+				// 如果feedback不存在,则追加
+				if !found {
+					feedbacks = append(feedbacks, nf)
+					c.PositiveCache.Set(f.UserId, feedbacks)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (s *RestServer) collaborativeRecommendHNSW(rankingIndex *search.HNSW, userId string, itemCategories []string, excludeSet mapset.Set[string], itemCache *ItemCache) (map[string][]string, time.Duration, error) {
+	userIndex := s.RankingModel.GetUserIndex().ToNumber(userId)
+	localStartTime := time.Now()
+	values, _ := rankingIndex.MultiSearch(search.NewDenseVector(s.RankingModel.GetUserFactor(userIndex), nil, false),
+		itemCategories, s.Config.Recommend.CacheSize+excludeSet.Cardinality(), false)
+	// save result
+	recommend := make(map[string][]string)
+	for category, catValues := range values {
+		recommendItems := make([]string, 0, len(catValues))
+		for i := range catValues {
+			itemId := s.RankingModel.GetItemIndex().ToName(catValues[i])
+			if !excludeSet.Contains(itemId) && itemCache.IsAvailable(itemId) {
+				recommendItems = append(recommendItems, itemId)
+			}
+		}
+		recommend[category] = recommendItems
+	}
+	return recommend, time.Since(localStartTime), nil
+}
+
+func (s *RestServer) collaborativeRecommendBruteForce(userId string, itemCategories []string, excludeSet mapset.Set[string], itemCache *ItemCache) (map[string][]string, time.Duration, error) {
+	userIndex := s.RankingModel.GetUserIndex().ToNumber(userId)
+	itemIds := s.RankingModel.GetItemIndex().GetNames()
+	localStartTime := time.Now()
+	recItemsFilters := make(map[string]*heap.TopKFilter[string, float64])
+	for _, category := range itemCategories {
+		recItemsFilters[category] = heap.NewTopKFilter[string, float64](s.Config.Recommend.CacheSize)
+	}
+	for itemIndex, itemId := range itemIds {
+		if !excludeSet.Contains(itemId) && itemCache.IsAvailable(itemId) && s.RankingModel.IsItemPredictable(int32(itemIndex)) {
+			prediction := s.RankingModel.InternalPredict(userIndex, int32(itemIndex))
+			for _, category := range itemCategories {
+				recItemsFilters[category].Push(itemId, float64(prediction))
+			}
+		}
+	}
+	// save result
+	recommend := make(map[string][]string)
+	for category, recItemsFilter := range recItemsFilters {
+		recommendItems, _ := recItemsFilter.PopAll()
+		recommend[category] = recommendItems
+	}
+	return recommend, time.Since(localStartTime), nil
+}
+
+func (s *RestServer) rankByCollaborativeFiltering(userId string, candidates [][]string) ([]cache.Document, error) {
+	// concat candidates
+	memo := mapset.NewSet[string]()
+	var itemIds []string
+	for _, v := range candidates {
+		for _, itemId := range v {
+			if !memo.Contains(itemId) {
+				memo.Add(itemId)
+				itemIds = append(itemIds, itemId)
+			}
+		}
+	}
+	// rank by collaborative filtering
+	topItems := make([]cache.Document, 0, len(candidates))
+	for _, itemId := range itemIds {
+		topItems = append(topItems, cache.Document{
+			Id:    itemId,
+			Score: float64(s.RankingModel.Predict(userId, itemId)),
+		})
+	}
+	cache.SortDocuments(topItems)
+	return topItems, nil
+}
+
+// rankByClickTroughRate ranks items by predicted click-through-rate.
+func (s *RestServer) rankByClickTroughRate(user *data.User, candidates [][]string, itemCache *ItemCache, predictor click.FactorizationMachine) ([]cache.Document, error) {
+	// concat candidates
+	memo := mapset.NewSet[string]()
+	var itemIds []string
+	for _, v := range candidates {
+		for _, itemId := range v {
+			if !memo.Contains(itemId) {
+				memo.Add(itemId)
+				itemIds = append(itemIds, itemId)
+			}
+		}
+	}
+	// download items
+	items := make([]*data.Item, 0, len(itemIds))
+	for _, itemId := range itemIds {
+		if item, exist := itemCache.Get(itemId); exist {
+			items = append(items, item)
+		} else {
+			log.Logger().Warn("item doesn't exists in database", zap.String("item_id", itemId))
+		}
+	}
+	// rank by CTR
+	topItems := make([]cache.Document, 0, len(items))
+	if batchPredictor, ok := predictor.(click.BatchInference); ok {
+		inputs := make([]lo.Tuple4[string, string, []click.Feature, []click.Feature], len(items))
+		for i, item := range items {
+			inputs[i].A = user.UserId
+			inputs[i].B = item.ItemId
+			inputs[i].C = click.ConvertLabelsToFeatures(user.Labels)
+			inputs[i].D = click.ConvertLabelsToFeatures(item.Labels)
+		}
+		output := batchPredictor.BatchPredict(inputs)
+		for i, score := range output {
+			topItems = append(topItems, cache.Document{
+				Id:    items[i].ItemId,
+				Score: float64(score),
+			})
+		}
+	} else {
+		for _, item := range items {
+			topItems = append(topItems, cache.Document{
+				Id:    item.ItemId,
+				Score: float64(predictor.Predict(user.UserId, item.ItemId, click.ConvertLabelsToFeatures(user.Labels), click.ConvertLabelsToFeatures(item.Labels))),
+			})
+		}
+	}
+	cache.SortDocuments(topItems)
+	return topItems, nil
+}
+
+func (s *RestServer) mergeAndShuffle(candidates [][]string) []cache.Document {
+	memo := mapset.NewSet[string]()
+	pos := make([]int, len(candidates))
+	var recommend []cache.Document
+	for {
+		// filter out ended slice
+		var src []int
+		for i := range candidates {
+			if pos[i] < len(candidates[i]) {
+				src = append(src, i)
+			}
+		}
+		if len(src) == 0 {
+			break
+		}
+		// select a slice randomly
+		j := src[s.Server.randGenerator.Intn(len(src))]
+		candidateId := candidates[j][pos[j]]
+		pos[j]++
+		if !memo.Contains(candidateId) {
+			memo.Add(candidateId)
+			recommend = append(recommend, cache.Document{Score: math.Exp(float64(-len(recommend))), Id: candidateId})
+		}
+	}
+	return recommend
+}
+
+// replacement inserts historical items back to recommendation.
+func (s *RestServer) replacement(recommend map[string][]cache.Document, user *data.User, historyItems []string, oriPositiveItems []string, itemCache *ItemCache) (map[string][]cache.Document, error) {
+	upperBounds := make(map[string]float64)
+	lowerBounds := make(map[string]float64)
+	newRecommend := make(map[string][]cache.Document)
+	for category, scores := range recommend {
+		// find minimal score
+		if len(scores) > 0 {
+			s := lo.Map(scores, func(score cache.Document, _ int) float64 {
+				return score.Score
+			})
+			upperBounds[category] = funk.MaxFloat64(s)
+			lowerBounds[category] = funk.MinFloat64(s)
+		} else {
+			upperBounds[category] = math.Inf(1)
+			lowerBounds[category] = math.Inf(-1)
+		}
+		// add scores to filters
+		newRecommend[category] = append(newRecommend[category], scores...)
+	}
+
+	// remove duplicates
+	positiveItems := mapset.NewSet[string]()
+	distinctItems := mapset.NewSet[string]()
+	for _, id := range historyItems {
+		if funk.ContainsString(oriPositiveItems, id) {
+			positiveItems.Add(id)
+			distinctItems.Add(id)
+		} else {
+			distinctItems.Add(id)
+		}
+	}
+
+	for _, itemId := range distinctItems.ToSlice() {
+		if item, exist := itemCache.Get(itemId); exist {
+			// scoring item
+			// 1. If click-through rate prediction model is available, use it.
+			// 2. If collaborative filtering model is available, use it.
+			// 3. Otherwise, give a random score.
+			var score float64
+			if s.Config.Recommend.Offline.EnableClickThroughPrediction && s.ClickModel != nil {
+				score = float64(s.ClickModel.Predict(user.UserId, itemId, click.ConvertLabelsToFeatures(user.Labels), click.ConvertLabelsToFeatures(item.Labels)))
+			} else if s.RankingModel != nil && !s.RankingModel.Invalid() && s.RankingModel.IsUserPredictable(s.RankingModel.GetUserIndex().ToNumber(user.UserId)) {
+				score = float64(s.RankingModel.Predict(user.UserId, itemId))
+			} else {
+				upper := upperBounds[""]
+				lower := lowerBounds[""]
+				if !math.IsInf(upper, 1) && !math.IsInf(lower, -1) {
+					score = lower + s.Server.randGenerator.Float64()*(upper-lower)
+				} else {
+					score = s.Server.randGenerator.Float64()
+				}
+			}
+			// replace item
+			for _, category := range append([]string{""}, item.Categories...) {
+				upperBound := upperBounds[category]
+				lowerBound := lowerBounds[category]
+				if !math.IsInf(upperBound, 1) && !math.IsInf(lowerBound, -1) {
+					// decay item
+					score -= lowerBound
+					if score < 0 {
+						continue
+					} else if positiveItems.Contains(itemId) {
+						score *= s.Config.Recommend.Replacement.PositiveReplacementDecay
+					} else {
+						score *= s.Config.Recommend.Replacement.ReadReplacementDecay
+					}
+					score += lowerBound
+				}
+				newRecommend[category] = append(newRecommend[category], cache.Document{Id: itemId, Score: score})
+			}
+		} else {
+			log.Logger().Warn("item doesn't exists in database", zap.String("item_id", itemId))
+		}
+	}
+
+	// rank items
+	for _, r := range newRecommend {
+		cache.SortDocuments(r)
+	}
+	return newRecommend, nil
+}
+
+func (s *RestServer) exploreRecommend(exploitRecommend []cache.Document, excludeSet mapset.Set[string], category string) ([]cache.Document, error) {
+	var localExcludeSet mapset.Set[string]
+	if s.Config.Recommend.Replacement.EnableReplacement {
+		localExcludeSet = mapset.NewSet[string]()
+	} else {
+		localExcludeSet = excludeSet.Clone()
+	}
+	// create thresholds
+	explorePopularThreshold := 0.0
+	if threshold, exist := s.Config.Recommend.Offline.GetExploreRecommend("popular"); exist {
+		explorePopularThreshold = threshold
+	}
+	exploreLatestThreshold := explorePopularThreshold
+	if threshold, exist := s.Config.Recommend.Offline.GetExploreRecommend("latest"); exist {
+		exploreLatestThreshold += threshold
+	}
+	// load popular items
+	popularItems := s.GetPopularItems(category)
+	// load the latest items
+	latestItems := s.GetLatestItems(category)
+	// explore recommendation
+	var exploreRecommend []cache.Document
+	score := 1.0
+	if len(exploitRecommend) > 0 {
+		score += exploitRecommend[0].Score
+	}
+	for range exploitRecommend {
+		dice := s.Server.randGenerator.Float64()
+		var recommendItem cache.Document
+		if dice < explorePopularThreshold && len(popularItems) > 0 {
+			score -= 1e-5
+			recommendItem.Id = popularItems[0].Id
+			recommendItem.Score = score
+			popularItems = popularItems[1:]
+		} else if dice < exploreLatestThreshold && len(latestItems) > 0 {
+			score -= 1e-5
+			recommendItem.Id = latestItems[0].Id
+			recommendItem.Score = score
+			latestItems = latestItems[1:]
+		} else if len(exploitRecommend) > 0 {
+			recommendItem = exploitRecommend[0]
+			exploitRecommend = exploitRecommend[1:]
+			score = recommendItem.Score
+		} else {
+			break
+		}
+		if !localExcludeSet.Contains(recommendItem.Id) {
+			localExcludeSet.Add(recommendItem.Id)
+			exploreRecommend = append(exploreRecommend, recommendItem)
+		}
+	}
+	return exploreRecommend, nil
+}
+
 func (s *RestServer) RecommendOffline(ctx *recommendContext) error {
+	log.Logger().Debug("start offline recommendation")
 	if len(ctx.results) < ctx.n {
 		start := time.Now()
 		recommendation, err := s.CacheClient.SearchDocuments(ctx.context, cache.OfflineRecommend, ctx.userId, ctx.categories, 0, s.Config.Recommend.CacheSize)
@@ -966,6 +1850,7 @@ func (s *RestServer) RecommendPopular(ctx *recommendContext) error {
 }
 
 func (s *RestServer) getRecommend(request *restful.Request, response *restful.Response) {
+	log.Logger().Debug("server start get recommendation")
 	ctx := context.Background()
 	if request != nil && request.Request != nil {
 		ctx = request.Request.Context()
@@ -993,7 +1878,7 @@ func (s *RestServer) getRecommend(request *restful.Request, response *restful.Re
 		return
 	}
 	// online recommendation
-	recommenders := []Recommender{s.RecommendOffline}
+	recommenders := []Recommender{s.RecommendOnline}
 	for _, recommender := range s.Config.Recommend.Online.FallbackRecommend {
 		switch recommender {
 		case "collaborative":
@@ -1699,9 +2584,12 @@ func (s *RestServer) insertFeedback(overwrite bool) func(request *restful.Reques
 			}
 		}
 		// insert feedback to data store
-		err = s.DataClient.BatchInsertFeedback(ctx, feedback,
-			s.Config.Server.AutoInsertUser,
-			s.Config.Server.AutoInsertItem, overwrite)
+		// err = s.DataClient.BatchInsertFeedback(ctx, feedback,
+		// 	s.Config.Server.AutoInsertUser,
+		// 	s.Config.Server.AutoInsertItem, overwrite)
+
+		// insert feedback to cache and data store
+		err = s.feedbackCache.InsertFeedback(ctx, feedback, overwrite)
 		if err != nil {
 			InternalServerError(response, err)
 			return
@@ -1944,4 +2832,424 @@ func withWildCard(categories []string) []string {
 	copy(result, categories)
 	result = append(result, "")
 	return result
+}
+
+// 添加初始化和更新 itemCache 的方法
+func (s *RestServer) initItemCache(ctx context.Context) error {
+	itemCache, _, err := s.pullItems(ctx)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	s.itemCacheLock.Lock()
+	s.itemCache = itemCache
+	s.itemCacheLock.Unlock()
+
+	// 启动定期更新
+	go s.periodicItemCacheUpdate(ctx)
+
+	return nil
+}
+
+func (s *RestServer) periodicItemCacheUpdate(ctx context.Context) {
+	// FIXME 可以由master节点收到更新数据时通知更新
+	// 每5分钟更新一次
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			itemCache, _, err := s.pullItems(ctx)
+			if err != nil {
+				log.Logger().Error("failed to update item cache", zap.Error(err))
+				continue
+			}
+
+			s.itemCacheLock.Lock()
+			s.itemCache = itemCache
+			s.itemCacheLock.Unlock()
+
+			log.Logger().Info("item cache updated",
+				zap.Int("item_count", itemCache.Len()),
+				// 这样计算cache_size_bytes不准确
+				/*zap.Int("cache_size_bytes", itemCache.Bytes())*/)
+		}
+	}
+}
+
+// 初始化缓存
+func (s *RestServer) initCache(ctx context.Context) error {
+	// 初始化map
+	s.popularItems = make(map[string][]cache.Document)
+	s.latestItems = make(map[string][]cache.Document)
+	s.itemNeighbors = make(map[string][]cache.Document)
+	s.userNeighbors = make(map[string][]cache.Document)
+
+	// 从缓存数据库加载数据
+	if err := s.loadPopularItems(ctx); err != nil {
+		return err
+	}
+	if err := s.loadLatestItems(ctx); err != nil {
+		return err
+	}
+
+	// 启动定期更新
+	go s.periodicCacheUpdate(ctx)
+
+	return nil
+}
+
+// 加载热门物品
+func (s *RestServer) loadPopularItems(ctx context.Context) error {
+	// 获取所有分类
+	categories, err := s.CacheClient.GetSet(ctx, cache.ItemCategories)
+	if err != nil {
+		return err
+	}
+	categories = append(categories, "") // 添加空分类
+
+	// 加载每个分类的热门物品
+	for _, category := range categories {
+		items, err := s.CacheClient.SearchDocuments(ctx, cache.PopularItems, "", []string{category}, 0, s.Config.Recommend.CacheSize)
+		if err != nil {
+			return err
+		}
+		s.cacheLock.Lock()
+		s.popularItems[category] = items
+		s.cacheLock.Unlock()
+
+		log.Logger().Info("popular items cache updated",
+			zap.String("category", category),
+			zap.Int("item_count", len(items)),
+			// 这样计算cache_size_bytes不准确
+			/*zap.Int("cache_size_bytes", len(items)*8)*/)
+	}
+	return nil
+}
+
+// 加载最新物品
+func (s *RestServer) loadLatestItems(ctx context.Context) error {
+	// 获取所有分类
+	categories, err := s.CacheClient.GetSet(ctx, cache.ItemCategories)
+	if err != nil {
+		return err
+	}
+	categories = append(categories, "") // 添加空分类
+
+	// 加载每个分类的最新物品
+	for _, category := range categories {
+		items, err := s.CacheClient.SearchDocuments(ctx, cache.LatestItems, "", []string{category}, 0, s.Config.Recommend.CacheSize)
+		if err != nil {
+			return err
+		}
+		s.cacheLock.Lock()
+		s.latestItems[category] = items
+		s.cacheLock.Unlock()
+
+		log.Logger().Info("latest items cache updated",
+			zap.String("category", category),
+			zap.Int("item_count", len(items)),
+			// 这样计算cache_size_bytes不准确
+			/*zap.Int("cache_size_bytes", len(items)*8)*/)
+	}
+	return nil
+}
+
+func (s *RestServer) loadNeighbors(ctx context.Context) error {
+	if s.Server.masterClient == nil {
+		log.Logger().Warn("master client is not initialized")
+		return nil
+	}
+	neighborsStatus, err := s.Server.masterClient.GetNeighborsStatus(ctx, &protocol.Empty{})
+	if err != nil {
+		return err
+	}
+
+	log.Logger().Debug("neighbors status",
+		zap.Bool("item_neighbors_finished", neighborsStatus.ItemNeighborsFinished),
+		zap.Bool("user_neighbors_finished", neighborsStatus.UserNeighborsFinished),
+		zap.Int64("item_neighbors_version", neighborsStatus.ItemNeighborsVersion),
+		zap.Int64("user_neighbors_version", neighborsStatus.UserNeighborsVersion))
+
+	s.cacheLock.Lock()
+	if s.itemNeighborsVersion != neighborsStatus.ItemNeighborsVersion {
+		s.itemNeighborsVersion = neighborsStatus.ItemNeighborsVersion
+		s.itemNeighbors = make(map[string][]cache.Document)
+		log.Logger().Info("item neighbors cache updated",
+			zap.Int64("version", s.itemNeighborsVersion))
+	}
+	if s.userNeighborsVersion != neighborsStatus.UserNeighborsVersion {
+		s.userNeighborsVersion = neighborsStatus.UserNeighborsVersion
+		s.userNeighbors = make(map[string][]cache.Document)
+		log.Logger().Info("user neighbors cache updated",
+			zap.Int64("version", s.userNeighborsVersion))
+	}
+	s.cacheLock.Unlock()
+
+	return nil
+}
+
+// 定期更新缓存
+func (s *RestServer) periodicCacheUpdate(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := s.loadPopularItems(ctx); err != nil {
+				log.Logger().Error("failed to update popular items cache", zap.Error(err))
+			}
+			if err := s.loadLatestItems(ctx); err != nil {
+				log.Logger().Error("failed to update latest items cache", zap.Error(err))
+			}
+			if err := s.loadNeighbors(ctx); err != nil {
+				log.Logger().Error("failed to update neighbors cache", zap.Error(err))
+			}
+		}
+	}
+}
+
+// 获取热门物品
+func (s *RestServer) GetPopularItems(category string) []cache.Document {
+	s.cacheLock.RLock()
+	defer s.cacheLock.RUnlock()
+	return s.popularItems[category]
+}
+
+// 获取最新物品
+func (s *RestServer) GetLatestItems(category string) []cache.Document {
+	s.cacheLock.RLock()
+	defer s.cacheLock.RUnlock()
+	return s.latestItems[category]
+}
+
+// 获取物品邻居
+func (s *RestServer) GetItemNeighbors(itemId string, category string) ([]cache.Document, error) {
+	s.cacheLock.RLock()
+	if items, ok := s.itemNeighbors[itemId]; ok {
+		s.cacheLock.RUnlock()
+		return items, nil
+	}
+	s.cacheLock.RUnlock()
+
+	// 如果缓存中没有,从缓存数据库加载
+	items, err := s.CacheClient.SearchDocuments(context.Background(), cache.ItemNeighbors, itemId, []string{category}, 0, s.Config.Recommend.CacheSize)
+	if err != nil {
+		return nil, err
+	}
+	var newItems []cache.Document
+	for _, item := range items {
+		newItems = append(newItems, cache.Document{Id: item.Id, Score: item.Score})
+	}
+
+	// 写入缓存
+	s.cacheLock.Lock()
+	s.itemNeighbors[itemId] = newItems
+	s.cacheLock.Unlock()
+
+	return newItems, nil
+}
+
+// 获取用户邻居
+func (s *RestServer) GetUserNeighbors(userId string) ([]cache.Document, error) {
+	s.cacheLock.RLock()
+	if users, ok := s.userNeighbors[userId]; ok {
+		s.cacheLock.RUnlock()
+		return users, nil
+	}
+	s.cacheLock.RUnlock()
+
+	// 如果缓存中没有,从缓存数据库加载
+	users, err := s.CacheClient.SearchDocuments(context.Background(), cache.UserNeighbors, userId, []string{""}, 0, s.Config.Recommend.CacheSize)
+	if err != nil {
+		return nil, err
+	}
+
+	var newUsers []cache.Document
+	for _, user := range users {
+		newUsers = append(newUsers, cache.Document{Id: user.Id, Score: user.Score})
+	}
+
+	// 写入缓存
+	s.cacheLock.Lock()
+	s.userNeighbors[userId] = newUsers
+	s.cacheLock.Unlock()
+
+	return newUsers, nil
+}
+
+func (s *RestServer) reportCacheSize(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.handleCacheSize()
+		}
+	}
+}
+
+func (s *RestServer) handleCacheSize() {
+	start := time.Now()
+	s.itemCacheLock.RLock()
+	itemCacheSize := calculateSize(s.itemCache.Data)
+	s.itemCacheLock.RUnlock()
+
+	feedbackCacheSize := calculateSize(s.feedbackCache.Cache)
+	positiveFeedbackCacheSize := calculateSize(s.feedbackCache.PositiveCache)
+
+	// 添加内存缓存
+	s.cacheLock.RLock()
+	popularItemsSize := calculateSize(s.popularItems)
+	latestItemsSize := calculateSize(s.latestItems)
+	itemNeighborsSize := calculateSize(s.itemNeighbors)
+	userNeighborsSize := calculateSize(s.userNeighbors)
+	s.cacheLock.RUnlock()
+
+	const bytesToMB = 1024 * 1024 // 1 MB = 1024 * 1024 bytes
+	// const bytesToMB = 1 // 1 MB = 1024 * 1024 bytes
+	log.Logger().Info("cache size",
+		zap.String("total_size_mb", fmt.Sprintf("%.2f MB", float64(itemCacheSize+feedbackCacheSize+positiveFeedbackCacheSize+popularItemsSize+latestItemsSize+itemNeighborsSize+userNeighborsSize)/bytesToMB)),
+		zap.Float64("item_cache_size", float64(itemCacheSize)),
+		zap.Float64("feedback_cache_size", float64(feedbackCacheSize)),
+		zap.Float64("positive_feedback_cache_size", float64(positiveFeedbackCacheSize)),
+		zap.Float64("popular_items_size", float64(popularItemsSize)),
+		zap.Float64("latest_items_size", float64(latestItemsSize)),
+		zap.Float64("item_neighbors_size", float64(itemNeighborsSize)),
+		zap.Float64("user_neighbors_size", float64(userNeighborsSize)),
+		zap.Duration("duration", time.Since(start)))
+}
+
+func calculateSize(v interface{}) uintptr {
+	visited := make(map[uintptr]bool)
+	return sizeOf(reflect.ValueOf(v), visited)
+}
+
+func sizeOf(value reflect.Value, visited map[uintptr]bool) uintptr {
+	if !value.IsValid() {
+		return 0
+	}
+
+	// 先处理 ConcurrentMap
+	if value.CanInterface() {
+		if m, ok := value.Interface().(cmap.ConcurrentMap); ok {
+			var size uintptr
+			size += unsafe.Sizeof(m)
+
+			for item := range m.IterBuffered() {
+				size += reflect.TypeOf(rune(0)).Size() * uintptr(len(item.Key))
+				if feedbacks, ok := item.Val.([]data.Feedback); ok {
+					for _, feedback := range feedbacks {
+						size += reflect.TypeOf(rune(0)).Size() * uintptr(len(feedback.UserId))
+						size += reflect.TypeOf(rune(0)).Size() * uintptr(len(feedback.ItemId))
+						size += reflect.TypeOf(rune(0)).Size() * uintptr(len(feedback.FeedbackType))
+						size += unsafe.Sizeof(feedback.Timestamp)
+						size += unsafe.Sizeof(feedback)
+					}
+					size += unsafe.Sizeof(feedbacks)
+				}
+			}
+			return size
+		}
+	}
+
+	switch value.Kind() {
+	case reflect.Map:
+		if value.IsNil() {
+			return 0
+		}
+
+		// 添加安全检查
+		if !value.CanInterface() {
+			return unsafe.Sizeof(value.Interface())
+		}
+		var size uintptr
+		// 计算 map 结构本身的大小
+		size += unsafe.Sizeof(value.Interface())
+
+		// 特殊处理 map[string]*data.Item
+		if mapType := value.Type(); mapType.Key().Kind() == reflect.String &&
+			mapType.Elem().Kind() == reflect.Ptr &&
+			mapType.Elem().Elem().String() == "data.Item" {
+
+			iter := value.MapRange()
+			for iter.Next() {
+				key := iter.Key().String()
+				item := iter.Value().Interface().(*data.Item)
+
+				size += reflect.TypeOf(rune(0)).Size() * uintptr(len(key)) // key string
+				if item != nil {
+					size += reflect.TypeOf(item.ItemId).Size() * uintptr(len(item.ItemId))
+					size += reflect.TypeOf(item.Comment).Size() * uintptr(len(item.Comment))
+					size += encoding.StringsBytes(item.Categories)
+					size += reflect.TypeOf(*item).Size()
+				}
+
+				size += reflect.TypeOf(rune(0)).Size() * uintptr(len(key)) // ItemId 内容
+				size += unsafe.Sizeof("")                                  // ItemId 字符串结构体
+
+				size += unsafe.Sizeof(item.IsHidden) // bool 类型
+
+				size += unsafe.Sizeof(item.Categories) // 切片结构体
+				for _, category := range item.Categories {
+					size += reflect.TypeOf(rune(0)).Size() * uintptr(len(category)) // 字符串内容
+					size += unsafe.Sizeof("")                                       // 字符串结构体
+				}
+
+				size += unsafe.Sizeof(item.Timestamp) // time.Time 类型
+
+				if labels, ok := item.Labels.(map[string]any); ok {
+					size += unsafe.Sizeof(labels) // map 结构体
+					for k, v := range labels {
+						size += reflect.TypeOf(rune(0)).Size() * uintptr(len(k)) // key 内容
+						size += unsafe.Sizeof("")                                // key 字符串结构体
+						if str, ok := v.(string); ok {
+							size += reflect.TypeOf(rune(0)).Size() * uintptr(len(str)) // value 内容
+							size += unsafe.Sizeof("")                                  // value 字符串结构体
+						}
+					}
+				}
+
+				size += unsafe.Sizeof(item) // 指针大小
+
+			}
+			return size
+		}
+
+		// 计算所有键值对的大小
+		for _, key := range value.MapKeys() {
+			// 计算 key 的大小
+			size += sizeOf(key, visited)
+			// 计算 value ([]cache.Document) 的大小
+			slice := value.MapIndex(key)
+			if slice.Len() > 0 {
+				// 计算切片头的大小
+				size += unsafe.Sizeof(slice.Interface())
+				// 计算切片中每个元素的大小
+				for i := 0; i < slice.Len(); i++ {
+					size += sizeOf(slice.Index(i), visited)
+				}
+			}
+		}
+		return size
+
+	case reflect.Struct:
+		var size uintptr
+		for i := 0; i < value.NumField(); i++ {
+			size += sizeOf(value.Field(i), visited)
+		}
+		return unsafe.Sizeof(value.Interface()) + size
+
+	default:
+		return unsafe.Sizeof(value.Interface())
+	}
 }

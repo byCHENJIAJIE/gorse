@@ -18,15 +18,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/rand"
 	"time"
 
 	"github.com/emicklei/go-restful/v3"
 	"github.com/juju/errors"
 	"github.com/zhenghaoz/gorse/base"
+	"github.com/zhenghaoz/gorse/base/encoding"
 	"github.com/zhenghaoz/gorse/base/log"
+	"github.com/zhenghaoz/gorse/base/parallel"
+	"github.com/zhenghaoz/gorse/base/progress"
+	"github.com/zhenghaoz/gorse/base/search"
 	"github.com/zhenghaoz/gorse/cmd/version"
 	"github.com/zhenghaoz/gorse/config"
+	"github.com/zhenghaoz/gorse/model/click"
+	"github.com/zhenghaoz/gorse/model/ranking"
 	"github.com/zhenghaoz/gorse/protocol"
 	"github.com/zhenghaoz/gorse/storage/cache"
 	"github.com/zhenghaoz/gorse/storage/data"
@@ -51,6 +58,16 @@ type Server struct {
 	masterPort   int
 	testMode     bool
 	cacheFile    string
+
+	latestRankingModelVersion int64
+	latestClickModelVersion   int64
+	rankingIndex              *search.HNSW
+	randGenerator             *rand.Rand
+
+	syncedChan *parallel.ConditionChannel // meta synced events
+	pulledChan *parallel.ConditionChannel // model pulled events
+
+	tracer *progress.Tracer
 }
 
 // NewServer creates a server node.
@@ -64,8 +81,14 @@ func NewServer(masterHost string, masterPort int, serverHost string, serverPort 
 			HttpHost:   serverHost,
 			HttpPort:   serverPort,
 			WebService: new(restful.WebService),
+			IsMaster:   false,
 		},
+		randGenerator: base.NewRand(time.Now().UTC().UnixNano()),
+
+		syncedChan: parallel.NewConditionChannel(),
+		pulledChan: parallel.NewConditionChannel(),
 	}
+	s.RestServer.SetServer(s)
 	return s
 }
 
@@ -97,6 +120,8 @@ func (s *Server) Serve() {
 		zap.String("master_host", s.masterHost),
 		zap.Int("master_port", s.masterPort))
 
+	s.tracer = progress.NewTracer(s.serverName)
+
 	// connect to master
 	conn, err := grpc.Dial(fmt.Sprintf("%v:%v", s.masterHost, s.masterPort), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -104,7 +129,28 @@ func (s *Server) Serve() {
 	}
 	s.masterClient = protocol.NewMasterClient(conn)
 
+	// 先启动同步，等待第一次同步完成
+	syncDone := make(chan struct{})
+	go func() {
+		// 使用 Range 方法来监听信号
+		for range s.syncedChan.C {
+			close(syncDone)
+			break // 只需要第一次同步信号
+		}
+	}()
 	go s.Sync()
+
+	// 等待第一次同步完成，确保数据库连接已建立
+	select {
+	case <-syncDone:
+	case <-time.After(30 * time.Second):
+		log.Logger().Fatal("timeout waiting for first sync")
+	}
+
+	// 启动其他后台任务
+	go s.Pull()
+	go s.BuildRankingIndex()
+	// 启动http服务，需要等Sync中完成了database的初始化后才能启动
 	container := restful.NewContainer()
 	s.StartHttpServer(container)
 }
@@ -120,6 +166,7 @@ func (s *Server) Shutdown() {
 func (s *Server) Sync() {
 	defer base.CheckPanic()
 	log.Logger().Info("start meta sync", zap.Duration("meta_timeout", s.Config.Master.MetaTimeout))
+	firstSync := true
 	for {
 		var meta *protocol.Meta
 		var err error
@@ -178,10 +225,150 @@ func (s *Server) Sync() {
 			s.traceConfig = s.Config.Tracing
 		}
 
+		// check ranking model version
+		s.latestRankingModelVersion = meta.RankingModelVersion
+		if s.latestRankingModelVersion != s.RankingModelVersion {
+			log.Logger().Info("new ranking model found",
+				zap.String("old_version", encoding.Hex(s.RankingModelVersion)),
+				zap.String("new_version", encoding.Hex(s.latestRankingModelVersion)))
+			s.syncedChan.Signal()
+		}
+
+		// check click model version
+		s.latestClickModelVersion = meta.ClickModelVersion
+		if s.latestClickModelVersion != s.ClickModelVersion {
+			log.Logger().Info("new click model found",
+				zap.String("old_version", encoding.Hex(s.ClickModelVersion)),
+				zap.String("new_version", encoding.Hex(s.latestClickModelVersion)))
+			s.syncedChan.Signal()
+		}
+
+		if firstSync {
+			firstSync = false
+			s.syncedChan.Signal()
+		}
+
 	sleep:
 		if s.testMode {
 			return
 		}
 		time.Sleep(s.Config.Master.MetaTimeout)
+	}
+}
+
+// Pull user index and ranking model from master.
+func (s *Server) Pull() {
+	defer base.CheckPanic()
+	for range s.syncedChan.C {
+		pulled := false
+
+		// pull ranking model
+		if s.latestRankingModelVersion != s.RankingModelVersion {
+			log.Logger().Info("start pull ranking model")
+			if rankingModelReceiver, err := s.masterClient.GetRankingModel(context.Background(),
+				&protocol.VersionInfo{Version: s.latestRankingModelVersion},
+				grpc.MaxCallRecvMsgSize(math.MaxInt)); err != nil {
+				log.Logger().Error("failed to pull ranking model", zap.Error(err))
+			} else {
+				var rankingModel ranking.MatrixFactorization
+				rankingModel, err = protocol.UnmarshalRankingModel(rankingModelReceiver)
+				if err != nil {
+					log.Logger().Error("failed to unmarshal ranking model", zap.Error(err))
+				} else {
+					s.RankingModel = rankingModel
+					s.rankingIndex = nil
+					s.RankingModelVersion = s.latestRankingModelVersion
+					log.Logger().Info("synced ranking model",
+						zap.String("version", encoding.Hex(s.RankingModelVersion)))
+					pulled = true
+				}
+			}
+		}
+
+		// pull click model
+		if s.latestClickModelVersion != s.ClickModelVersion {
+			log.Logger().Info("start pull click model")
+			if clickModelReceiver, err := s.masterClient.GetClickModel(context.Background(),
+				&protocol.VersionInfo{Version: s.latestClickModelVersion},
+				grpc.MaxCallRecvMsgSize(math.MaxInt)); err != nil {
+				log.Logger().Error("failed to pull click model", zap.Error(err))
+			} else {
+				var clickModel click.FactorizationMachine
+				clickModel, err = protocol.UnmarshalClickModel(clickModelReceiver)
+				if err != nil {
+					log.Logger().Error("failed to unmarshal click model", zap.Error(err))
+				} else {
+					s.ClickModel = clickModel
+					s.ClickModelVersion = s.latestClickModelVersion
+					log.Logger().Info("synced click model",
+						zap.String("version", encoding.Hex(s.ClickModelVersion)))
+
+					pulled = true
+				}
+			}
+		}
+
+		// if s.testMode {
+		// 	return
+		// }
+		if pulled {
+			s.pulledChan.Signal()
+		}
+	}
+}
+
+// build ranking index
+func (s *Server) BuildRankingIndex() {
+	defer base.CheckPanic()
+	for range s.pulledChan.C {
+		ctx := context.Background()
+		itemCache, _, err := s.pullItems(ctx)
+		if err != nil {
+			log.Logger().Error("failed to pull items", zap.Error(err))
+			return
+		}
+
+		// FIXME 这里需要加上tracer
+		if s.RankingModel != nil && !s.RankingModel.Invalid() && s.rankingIndex == nil {
+			if s.Config.Recommend.Collaborative.EnableIndex {
+				startTime := time.Now()
+				log.Logger().Info("start building ranking index")
+				itemIndex := s.RankingModel.GetItemIndex()
+				vectors := make([]search.Vector, itemIndex.Len())
+				for i := int32(0); i < itemIndex.Len(); i++ {
+					itemId := itemIndex.ToName(i)
+					if itemCache.IsAvailable(itemId) {
+						vectors[i] = search.NewDenseVector(s.RankingModel.GetItemFactor(i), itemCache.GetCategory(itemId), false)
+					} else {
+						vectors[i] = search.NewDenseVector(s.RankingModel.GetItemFactor(i), nil, true)
+					}
+				}
+				builder := search.NewHNSWBuilder(vectors, s.Config.Recommend.CacheSize, s.Config.Server.NumJobs)
+
+				var recall float32
+				s.rankingIndex, recall = builder.Build(ctx, s.tracer, s.Config.Recommend.Collaborative.IndexRecall,
+					s.Config.Recommend.Collaborative.IndexFitEpoch, false)
+				// FIXME 好像是指标接口需要用到的，暂时先注释掉
+				// CollaborativeFilteringIndexRecall.Set(float64(recall))
+				if err = s.CacheClient.Set(ctx, cache.String(cache.Key(cache.GlobalMeta, cache.MatchingIndexRecall), encoding.FormatFloat32(recall))); err != nil {
+					log.Logger().Error("failed to write meta", zap.Error(err))
+				}
+				log.Logger().Info("complete building ranking index",
+					zap.Duration("build_time", time.Since(startTime)))
+
+				// 10秒一次
+				go func() {
+					for range time.Tick(10 * time.Second) {
+						progress := s.tracer.List()
+						// 向master报告进度
+						if _, err := s.masterClient.PushProgress(context.Background(), protocol.EncodeProgress(progress)); err != nil {
+							log.Logger().Error("failed to report update task", zap.Error(err))
+						}
+					}
+				}()
+			} else {
+				// CollaborativeFilteringIndexRecall.Set(1)
+			}
+		}
 	}
 }
