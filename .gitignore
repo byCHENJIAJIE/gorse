@@ -120,3 +120,14 @@ $RECYCLE.BIN/
 .vscode
 
 # End of https://www.gitignore.io/api/go,windows,jetbrains
+.idea/.gitignore
+.idea/gorse_lastest.iml
+.idea/misc.xml
+.idea/modules.xml
+.idea/vcs.xml
+.idea/runConfigurations/master.xml
+.idea/runConfigurations/server.xml
+.idea/runConfigurations/work.xml
+
+# Cache
+cache/*
