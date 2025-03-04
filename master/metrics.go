@@ -15,13 +15,19 @@
 package master
 
 import (
+	"context"
 	"time"
 
 	mapset "github.com/deckarep/golang-set/v2"
+	"github.com/juju/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/samber/lo"
+	"github.com/zhenghaoz/gorse/base/log"
+	"github.com/zhenghaoz/gorse/config"
 	"github.com/zhenghaoz/gorse/storage/cache"
+	"github.com/zhenghaoz/gorse/storage/data"
+	"go.uber.org/zap"
 )
 
 const (
@@ -303,4 +309,128 @@ func (evaluator *OnlineEvaluator) Evaluate() []cache.TimeSeriesPoint {
 		}
 	}
 	return measurements
+}
+
+// DailyFeedbackRateCollector 收集每日正反馈率
+type DailyFeedbackRateCollector struct {
+	ctx         context.Context
+	dataClient  data.Database
+	cacheClient cache.Database
+	config      *config.Config
+}
+
+func NewDailyFeedbackRateCollector(ctx context.Context, dataClient data.Database,
+	cacheClient cache.Database, config *config.Config) *DailyFeedbackRateCollector {
+	return &DailyFeedbackRateCollector{
+		ctx:         ctx,
+		dataClient:  dataClient,
+		cacheClient: cacheClient,
+		config:      config,
+	}
+}
+
+func (c *DailyFeedbackRateCollector) Start() {
+	go func() {
+		// 计算首次运行时间：下一个凌晨1点
+		now := time.Now()
+		nextRun := time.Date(now.Year(), now.Month(), now.Day()+1, 1, 0, 0, 0, now.Location())
+		log.Logger().Info("collect daily rate, first run time", zap.Time("next_run", nextRun))
+		time.Sleep(nextRun.Sub(now))
+
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if err := c.CollectDailyRate(); err != nil {
+					log.Logger().Error("failed to collect feedback rate", zap.Error(err))
+				}
+			case <-c.ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+func (c *DailyFeedbackRateCollector) CollectDailyRate() error {
+    yesterday := time.Now().Add(-24 * time.Hour)
+    startTime := time.Date(yesterday.Year(), yesterday.Month(), yesterday.Day(), 0, 0, 0, 0, yesterday.Location())
+    endTime := startTime.Add(24 * time.Hour)
+
+	log.Logger().Info("collect daily rate", zap.Time("start_time", startTime), zap.Time("end_time", endTime))
+
+    // 先获取所有阅读记录
+    readMap := make(map[string]mapset.Set[string])
+    totalReads := 0
+    
+    feedbackChan, errChan := c.dataClient.GetFeedbackStream(c.ctx, batchSize, 
+        data.WithBeginTime(startTime), 
+        data.WithEndTime(endTime), 
+        data.WithFeedbackTypes("read"))
+    
+    // 处理阅读数据流
+    for feedbacks := range feedbackChan {
+        for _, read := range feedbacks {
+            if readMap[read.UserId] == nil {
+                readMap[read.UserId] = mapset.NewSet[string]()
+            }
+            readMap[read.UserId].Add(read.ItemId)
+            totalReads++
+        }
+    }
+    
+    // 检查错误
+    if err := <-errChan; err != nil {
+        return errors.Trace(err)
+    }
+
+    // 对每种正反馈类型计算比率
+    for _, feedbackType := range c.config.Recommend.DataSource.PositiveFeedbackTypes {
+        positives := 0
+        
+        // 获取正反馈数据流
+        feedbackChan, errChan := c.dataClient.GetFeedbackStream(c.ctx, batchSize,
+            data.WithBeginTime(startTime),
+            data.WithEndTime(endTime),
+            data.WithFeedbackTypes(feedbackType))
+        
+        // 处理正反馈数据流
+        for feedbacks := range feedbackChan {
+            for _, positive := range feedbacks {
+                if readSet := readMap[positive.UserId]; readSet != nil && readSet.Contains(positive.ItemId) {
+                    positives++
+                }
+            }
+        }
+        
+        // 检查错误
+        if err := <-errChan; err != nil {
+            return errors.Trace(err)
+        }
+
+        // 计算正反馈率
+        var rate float64
+        if totalReads > 0 {
+            rate = float64(positives) / float64(totalReads)
+        }
+
+		log.Logger().Info("collect daily rate", zap.String("feedback_type", feedbackType), zap.Float64("rate", rate))
+        // 更新时间序列
+        err := c.cacheClient.AddTimeSeriesPoints(c.ctx, []cache.TimeSeriesPoint{
+            {
+                Name:      cache.Key(PositiveFeedbackRate, feedbackType),
+                Timestamp: startTime.Add(8 * time.Hour),
+                Value:     rate,
+            },
+        })
+        if err != nil {
+            return errors.Trace(err)
+        }
+
+        // 更新 Prometheus 指标
+        // PositiveFeedbackRate.WithLabelValues(feedbackType).Set(rate)
+    }
+
+    return nil
 }

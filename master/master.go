@@ -247,6 +247,9 @@ func (m *Master) Serve() {
 		go m.RunRagtagTasksLoop()
 		log.Logger().Info("start model searcher", zap.Duration("period", m.Config.Recommend.Collaborative.ModelSearchPeriod))
 	}
+	// 启动正反馈率收集器
+    collector := NewDailyFeedbackRateCollector(context.Background(), m.DataClient, m.CacheClient, m.Config)
+    collector.Start()
 
 	// start rpc server
 	go func() {
