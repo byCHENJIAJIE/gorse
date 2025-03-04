@@ -34,6 +34,7 @@ import (
 	"github.com/emicklei/go-restful/v3"
 	"github.com/google/uuid"
 	"github.com/juju/errors"
+	"github.com/maypok86/otter"
 	cmap "github.com/orcaman/concurrent-map"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/samber/lo"
@@ -81,18 +82,16 @@ type RestServer struct {
 	Server *Server
 
 	// 添加全局 itemCache
-	itemCache     *ItemCache
-	itemCacheLock sync.RWMutex
+	itemCache *ItemCache
 
 	// 添加全局 feedbackCache
 	feedbackCache *FeedbackCache
 
 	// 添加内存缓存
-	cacheLock            sync.RWMutex
-	popularItems         map[string][]cache.Document // 热门物品缓存,key为分类
-	latestItems          map[string][]cache.Document // 最新物品缓存,key为分类
-	itemNeighbors        map[string][]cache.Document // 物品邻居缓存,key为itemId
-	userNeighbors        map[string][]cache.Document // 用户邻居缓存,key为userId
+	popularItems         *sync.Map // 热门物品缓存,key为分类
+	latestItems          *sync.Map // 最新物品缓存,key为分类
+	itemNeighbors        *sync.Map // 物品邻居缓存,key为itemId
+	userNeighbors        *sync.Map // 用户邻居缓存,key为userId
 	itemNeighborsVersion int64
 	userNeighborsVersion int64
 }
@@ -108,7 +107,11 @@ func (s *RestServer) StartHttpServer(container *restful.Container) {
 		if err := s.initItemCache(context.Background()); err != nil {
 			log.Logger().Fatal("failed to initialize item cache", zap.Error(err))
 		}
-		s.feedbackCache = NewFeedbackCache(s, s.Config.Recommend.DataSource.PositiveFeedbackTypes...)
+		var err error
+		s.feedbackCache, err = NewFeedbackCache(s, s.Config.Recommend.DataSource.PositiveFeedbackTypes...)
+		if err != nil {
+			log.Logger().Fatal("failed to initialize feedback cache", zap.Error(err))
+		}
 
 		// 初始化内存缓存
 		if err := s.initCache(context.Background()); err != nil {
@@ -859,9 +862,7 @@ func (s *RestServer) RecommendOnline(ctx *recommendContext) error {
 	start := time.Now()
 
 	// 使用全局 itemCache
-	s.itemCacheLock.RLock()
 	itemCache := s.itemCache
-	s.itemCacheLock.RUnlock()
 
 	// 现在user的label是空的，不需要查数据库
 	// user, err := s.DataClient.GetUser(ctx.context, ctx.userId)
@@ -1218,38 +1219,37 @@ func (s *RestServer) pullItems(ctx context.Context) (*ItemCache, []string, error
 
 // ItemCache is alias of map[string]data.Item.
 type ItemCache struct {
-	Data      map[string]*data.Item
+	Data      *sync.Map
 	ByteCount uintptr
 }
 
 func NewItemCache() *ItemCache {
-	return &ItemCache{Data: make(map[string]*data.Item)}
-}
-
-func (c *ItemCache) Len() int {
-	return len(c.Data)
+	return &ItemCache{Data: &sync.Map{}}
 }
 
 func (c *ItemCache) Set(itemId string, item data.Item) {
-	if _, exist := c.Data[itemId]; !exist {
-		c.Data[itemId] = &data.Item{
+	if _, exist := c.Data.Load(itemId); !exist {
+		c.Data.Store(itemId, &data.Item{
 			ItemId:     item.ItemId,
 			IsHidden:   item.IsHidden,
 			Categories: item.Categories,
 			Timestamp:  item.Timestamp,
 			Labels:     item.Labels,
-		}
+		})
 	}
 }
 
 func (c *ItemCache) Get(itemId string) (*data.Item, bool) {
-	item, exist := c.Data[itemId]
-	return item, exist
+	item, exist := c.Data.Load(itemId)
+	if !exist {
+		return nil, false
+	}
+	return item.(*data.Item), true
 }
 
 func (c *ItemCache) GetCategory(itemId string) []string {
-	if item, exist := c.Data[itemId]; exist {
-		return item.Categories
+	if item, exist := c.Data.Load(itemId); exist {
+		return item.(*data.Item).Categories
 	} else {
 		return nil
 	}
@@ -1257,8 +1257,8 @@ func (c *ItemCache) GetCategory(itemId string) []string {
 
 // IsAvailable means the item exists in database and is not hidden.
 func (c *ItemCache) IsAvailable(itemId string) bool {
-	if item, exist := c.Data[itemId]; exist {
-		return !item.IsHidden
+	if item, exist := c.Data.Load(itemId); exist {
+		return !item.(*data.Item).IsHidden
 	} else {
 		return false
 	}
@@ -1273,20 +1273,61 @@ type FeedbackCache struct {
 	*config.Config
 	Client        data.Database
 	PositiveTypes []string
-	Cache         cmap.ConcurrentMap
-	PositiveCache cmap.ConcurrentMap
-	ByteCount     uintptr
+	Cache         *otter.Cache[string, []data.Feedback]
+	PositiveCache *otter.Cache[string, []data.Feedback]
+	// ByteCount     uintptr
 }
 
 // NewFeedbackCache creates a new FeedbackCache.
-func NewFeedbackCache(s *RestServer, positiveFeedbackTypes ...string) *FeedbackCache {
+func NewFeedbackCache(s *RestServer, positiveFeedbackTypes ...string) (*FeedbackCache, error) {
+	cacheMaxCost := s.Config.Server.FeedbackMaxCost
+	positiveCacheMaxCost := s.Config.Server.PositiveFeedbackMaxCost
+	cache, err := otter.MustBuilder[string, []data.Feedback](cacheMaxCost).
+		CollectStats().
+		Cost(func(key string, value []data.Feedback) uint32 {
+			return 1
+		}).
+		WithTTL(48 * time.Hour).
+		Build()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	positiveCache, err := otter.MustBuilder[string, []data.Feedback](positiveCacheMaxCost).
+		CollectStats().
+		Cost(func(key string, value []data.Feedback) uint32 {
+			return 1
+		}).
+		WithTTL(48 * time.Hour).
+		Build()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
 	return &FeedbackCache{
 		Config:        s.Config,
 		Client:        s.DataClient,
 		PositiveTypes: positiveFeedbackTypes,
-		Cache:         cmap.New(),
-		PositiveCache: cmap.New(),
+		Cache:         &cache,
+		PositiveCache: &positiveCache,
+	}, nil
+}
+
+func (c *FeedbackCache) Set(userId string, feedbacks []data.Feedback, isPositive bool) (bool, []data.Feedback) {
+	// 对 feedbacks 进行处理, 只保留 FeedbackKey, 降低cache的内存占用
+	items := make([]data.Feedback, 0, len(feedbacks))
+	for _, feedback := range feedbacks {
+		items = append(items, data.Feedback{FeedbackKey: data.FeedbackKey{ItemId: feedback.ItemId, FeedbackType: feedback.FeedbackType}})
 	}
+
+	cache := c.Cache
+	if isPositive {
+		cache = c.PositiveCache
+	}
+	ok := cache.Set(userId, items)
+	if !ok {
+		log.Logger().Error("failed to set feedback to cache",
+			zap.String("user_id", userId), zap.Any("items", items))
+	}
+	return ok, items
 }
 
 // GetUserFeedback gets user feedback from cache or database.
@@ -1294,20 +1335,15 @@ func (c *FeedbackCache) GetUserFeedback(ctx context.Context, userId string) ([]d
 	cache := c.Cache
 	if tmp, ok := cache.Get(userId); ok {
 		// log.Logger().Info("TimeUse: GetUserFeedback from cache", zap.String("user_id", userId))
-		return tmp.([]data.Feedback), nil
+		return tmp, nil
 	} else {
 		startTime := time.Now()
-		items := make([]data.Feedback, 0)
 		feedbacks, err := c.Client.GetUserFeedback(ctx, userId, c.Config.Now())
 		if err != nil {
 			return nil, err
 		}
 		log.Logger().Info("TimeUse: GetUserFeedback from database", zap.String("user_id", userId), zap.Duration("database_time", time.Since(startTime)))
-		for _, feedback := range feedbacks {
-			items = append(items, data.Feedback{FeedbackKey: data.FeedbackKey{ItemId: feedback.ItemId, FeedbackType: feedback.FeedbackType}})
-		}
-		// 缓存test
-		// cache.Set(userId, items)
+		_, items := c.Set(userId, feedbacks, false)
 		return items, nil
 	}
 }
@@ -1317,19 +1353,15 @@ func (c *FeedbackCache) GetUserPositiveFeedback(ctx context.Context, userId stri
 	cache := c.PositiveCache
 	if tmp, ok := cache.Get(userId); ok {
 		// log.Logger().Info("TimeUse: GetUserFeedback from cache", zap.String("user_id", userId))
-		return tmp.([]data.Feedback), nil
+		return tmp, nil
 	} else {
 		startTime := time.Now()
-		items := make([]data.Feedback, 0)
 		feedbacks, err := c.Client.GetUserFeedback(ctx, userId, c.Config.Now(), c.PositiveTypes...)
 		if err != nil {
 			return nil, err
 		}
 		log.Logger().Info("TimeUse: GetUserPositiveFeedback from database", zap.String("user_id", userId), zap.Duration("database_time", time.Since(startTime)))
-		for _, feedback := range feedbacks {
-			items = append(items, data.Feedback{FeedbackKey: data.FeedbackKey{ItemId: feedback.ItemId, FeedbackType: feedback.FeedbackType}})
-		}
-		cache.Set(userId, items)
+		_, items := c.Set(userId, feedbacks, true)
 		return items, nil
 	}
 }
@@ -1337,6 +1369,7 @@ func (c *FeedbackCache) GetUserPositiveFeedback(ctx context.Context, userId stri
 // InsertFeedback inserts feedback to cache and database.
 func (c *FeedbackCache) InsertFeedback(ctx context.Context, feedback []data.Feedback, overwrite bool) error {
 	// insert feedback to database
+	log.Logger().Debug("InsertFeedback", zap.Any("feedback", feedback))
 	err := c.Client.BatchInsertFeedback(ctx, feedback,
 		c.Config.Server.AutoInsertUser,
 		c.Config.Server.AutoInsertItem, overwrite)
@@ -1348,15 +1381,16 @@ func (c *FeedbackCache) InsertFeedback(ctx context.Context, feedback []data.Feed
 		nf := data.Feedback{FeedbackKey: data.FeedbackKey{ItemId: f.ItemId, FeedbackType: f.FeedbackType}}
 		// 缓存中没有这个用户的feedback，则无需处理
 		if existingFeedback, exists := c.Cache.Get(f.UserId); exists {
-			feedbacks := existingFeedback.([]data.Feedback)
+			feedbacks := existingFeedback
 			// 检查feedback是否已存在
 			found := false
-			for _, ef := range feedbacks {
+			for i, ef := range feedbacks {
 				if ef.ItemId == f.ItemId && ef.FeedbackType == f.FeedbackType {
 					found = true
 					if overwrite {
 						// 如果需要覆盖,则更新现有的feedback
-						ef = nf
+						feedbacks[i] = nf
+						c.Set(f.UserId, feedbacks, false)
 					}
 					break
 				}
@@ -1364,22 +1398,22 @@ func (c *FeedbackCache) InsertFeedback(ctx context.Context, feedback []data.Feed
 			// 如果feedback不存在,则追加
 			if !found {
 				feedbacks = append(feedbacks, nf)
-				// 缓存test
-				// c.Cache.Set(f.UserId, feedbacks)
+				c.Set(f.UserId, feedbacks, false)
 			}
 		}
 		// 正反馈处理
 		if funk.ContainsString(c.Config.Recommend.DataSource.PositiveFeedbackTypes, f.FeedbackType) {
 			if existingFeedback, exists := c.PositiveCache.Get(f.UserId); exists {
-				feedbacks := existingFeedback.([]data.Feedback)
+				feedbacks := existingFeedback
 				// 检查feedback是否已存在
 				found := false
-				for _, ef := range feedbacks {
+				for i, ef := range feedbacks {
 					if ef.ItemId == f.ItemId && ef.FeedbackType == f.FeedbackType {
 						found = true
 						if overwrite {
 							// 如果需要覆盖,则更新现有的feedback
-							ef = nf
+							feedbacks[i] = nf
+							c.Set(f.UserId, feedbacks, true)
 						}
 						break
 					}
@@ -1387,7 +1421,7 @@ func (c *FeedbackCache) InsertFeedback(ctx context.Context, feedback []data.Feed
 				// 如果feedback不存在,则追加
 				if !found {
 					feedbacks = append(feedbacks, nf)
-					c.PositiveCache.Set(f.UserId, feedbacks)
+					c.Set(f.UserId, feedbacks, true)
 				}
 			}
 		}
@@ -2841,9 +2875,7 @@ func (s *RestServer) initItemCache(ctx context.Context) error {
 		return errors.Trace(err)
 	}
 
-	s.itemCacheLock.Lock()
 	s.itemCache = itemCache
-	s.itemCacheLock.Unlock()
 
 	// 启动定期更新
 	go s.periodicItemCacheUpdate(ctx)
@@ -2868,14 +2900,11 @@ func (s *RestServer) periodicItemCacheUpdate(ctx context.Context) {
 				continue
 			}
 
-			s.itemCacheLock.Lock()
 			s.itemCache = itemCache
-			s.itemCacheLock.Unlock()
 
-			log.Logger().Info("item cache updated",
-				zap.Int("item_count", itemCache.Len()),
+			log.Logger().Info("item cache updated")
 				// 这样计算cache_size_bytes不准确
-				/*zap.Int("cache_size_bytes", itemCache.Bytes())*/)
+				/*zap.Int("cache_size_bytes", itemCache.Bytes())*/
 		}
 	}
 }
@@ -2883,10 +2912,10 @@ func (s *RestServer) periodicItemCacheUpdate(ctx context.Context) {
 // 初始化缓存
 func (s *RestServer) initCache(ctx context.Context) error {
 	// 初始化map
-	s.popularItems = make(map[string][]cache.Document)
-	s.latestItems = make(map[string][]cache.Document)
-	s.itemNeighbors = make(map[string][]cache.Document)
-	s.userNeighbors = make(map[string][]cache.Document)
+	s.popularItems = &sync.Map{}
+	s.latestItems = &sync.Map{}
+	s.itemNeighbors = &sync.Map{}
+	s.userNeighbors = &sync.Map{}
 
 	// 从缓存数据库加载数据
 	if err := s.loadPopularItems(ctx); err != nil {
@@ -2917,9 +2946,7 @@ func (s *RestServer) loadPopularItems(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		s.cacheLock.Lock()
-		s.popularItems[category] = items
-		s.cacheLock.Unlock()
+		s.popularItems.Store(category, items)
 
 		log.Logger().Info("popular items cache updated",
 			zap.String("category", category),
@@ -2945,9 +2972,7 @@ func (s *RestServer) loadLatestItems(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		s.cacheLock.Lock()
-		s.latestItems[category] = items
-		s.cacheLock.Unlock()
+		s.latestItems.Store(category, items)
 
 		log.Logger().Info("latest items cache updated",
 			zap.String("category", category),
@@ -2974,27 +2999,25 @@ func (s *RestServer) loadNeighbors(ctx context.Context) error {
 		zap.Int64("item_neighbors_version", neighborsStatus.ItemNeighborsVersion),
 		zap.Int64("user_neighbors_version", neighborsStatus.UserNeighborsVersion))
 
-	s.cacheLock.Lock()
 	if s.itemNeighborsVersion != neighborsStatus.ItemNeighborsVersion {
 		s.itemNeighborsVersion = neighborsStatus.ItemNeighborsVersion
-		s.itemNeighbors = make(map[string][]cache.Document)
+		s.itemNeighbors = &sync.Map{}
 		log.Logger().Info("item neighbors cache updated",
 			zap.Int64("version", s.itemNeighborsVersion))
 	}
 	if s.userNeighborsVersion != neighborsStatus.UserNeighborsVersion {
 		s.userNeighborsVersion = neighborsStatus.UserNeighborsVersion
-		s.userNeighbors = make(map[string][]cache.Document)
+		s.userNeighbors = &sync.Map{}
 		log.Logger().Info("user neighbors cache updated",
 			zap.Int64("version", s.userNeighborsVersion))
 	}
-	s.cacheLock.Unlock()
 
 	return nil
 }
 
 // 定期更新缓存
 func (s *RestServer) periodicCacheUpdate(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -3011,32 +3034,29 @@ func (s *RestServer) periodicCacheUpdate(ctx context.Context) {
 			if err := s.loadNeighbors(ctx); err != nil {
 				log.Logger().Error("failed to update neighbors cache", zap.Error(err))
 			}
+			s.reportStat()
 		}
 	}
 }
 
 // 获取热门物品
 func (s *RestServer) GetPopularItems(category string) []cache.Document {
-	s.cacheLock.RLock()
-	defer s.cacheLock.RUnlock()
-	return s.popularItems[category]
+	items, _ := s.popularItems.Load(category)
+	return items.([]cache.Document)
 }
 
 // 获取最新物品
 func (s *RestServer) GetLatestItems(category string) []cache.Document {
-	s.cacheLock.RLock()
-	defer s.cacheLock.RUnlock()
-	return s.latestItems[category]
+	items, _ := s.latestItems.Load(category)
+	return items.([]cache.Document)
 }
 
 // 获取物品邻居
 func (s *RestServer) GetItemNeighbors(itemId string, category string) ([]cache.Document, error) {
-	s.cacheLock.RLock()
-	if items, ok := s.itemNeighbors[itemId]; ok {
-		s.cacheLock.RUnlock()
-		return items, nil
+	items, _ := s.itemNeighbors.Load(itemId)
+	if items != nil {
+		return items.([]cache.Document), nil
 	}
-	s.cacheLock.RUnlock()
 
 	// 如果缓存中没有,从缓存数据库加载
 	items, err := s.CacheClient.SearchDocuments(context.Background(), cache.ItemNeighbors, itemId, []string{category}, 0, s.Config.Recommend.CacheSize)
@@ -3044,26 +3064,22 @@ func (s *RestServer) GetItemNeighbors(itemId string, category string) ([]cache.D
 		return nil, err
 	}
 	var newItems []cache.Document
-	for _, item := range items {
+	for _, item := range items.([]cache.Document) {
 		newItems = append(newItems, cache.Document{Id: item.Id, Score: item.Score})
 	}
 
 	// 写入缓存
-	s.cacheLock.Lock()
-	s.itemNeighbors[itemId] = newItems
-	s.cacheLock.Unlock()
+	s.itemNeighbors.Store(itemId, newItems)
 
 	return newItems, nil
 }
 
 // 获取用户邻居
 func (s *RestServer) GetUserNeighbors(userId string) ([]cache.Document, error) {
-	s.cacheLock.RLock()
-	if users, ok := s.userNeighbors[userId]; ok {
-		s.cacheLock.RUnlock()
-		return users, nil
+	users, _ := s.userNeighbors.Load(userId)
+	if users != nil {
+		return users.([]cache.Document), nil
 	}
-	s.cacheLock.RUnlock()
 
 	// 如果缓存中没有,从缓存数据库加载
 	users, err := s.CacheClient.SearchDocuments(context.Background(), cache.UserNeighbors, userId, []string{""}, 0, s.Config.Recommend.CacheSize)
@@ -3072,16 +3088,38 @@ func (s *RestServer) GetUserNeighbors(userId string) ([]cache.Document, error) {
 	}
 
 	var newUsers []cache.Document
-	for _, user := range users {
+	for _, user := range users.([]cache.Document) {
 		newUsers = append(newUsers, cache.Document{Id: user.Id, Score: user.Score})
 	}
 
 	// 写入缓存
-	s.cacheLock.Lock()
-	s.userNeighbors[userId] = newUsers
-	s.cacheLock.Unlock()
+	s.userNeighbors.Store(userId, newUsers)
 
 	return newUsers, nil
+}
+
+func (s *RestServer) reportStat() {
+	stats := s.feedbackCache.Cache.Stats()
+	log.Logger().Debug("feedbackCache Stats",
+		zap.Int("Size", s.feedbackCache.Cache.Size()),
+		zap.Int64("EvictedCost", stats.EvictedCost()),
+		zap.Int64("EvictedCount", stats.EvictedCount()),
+		zap.Int64("Hits", stats.Hits()),
+		zap.Int64("Misses", stats.Misses()),
+		zap.Float64("Ratio", stats.Ratio()),
+		zap.Int64("RejectedSets", stats.RejectedSets()),
+	)
+
+	positiveStats := s.feedbackCache.PositiveCache.Stats()
+	log.Logger().Debug("positive feedbackCache Stats",
+		zap.Int("Size", s.feedbackCache.PositiveCache.Size()),
+		zap.Int64("EvictedCost", positiveStats.EvictedCost()),
+		zap.Int64("EvictedCount", positiveStats.EvictedCount()),
+		zap.Int64("Hits", positiveStats.Hits()),
+		zap.Int64("Misses", positiveStats.Misses()),
+		zap.Float64("Ratio", positiveStats.Ratio()),
+		zap.Int64("RejectedSets", positiveStats.RejectedSets()),
+	)
 }
 
 func (s *RestServer) reportCacheSize(ctx context.Context) {
@@ -3100,20 +3138,16 @@ func (s *RestServer) reportCacheSize(ctx context.Context) {
 
 func (s *RestServer) handleCacheSize() {
 	start := time.Now()
-	s.itemCacheLock.RLock()
 	itemCacheSize := calculateSize(s.itemCache.Data)
-	s.itemCacheLock.RUnlock()
 
 	feedbackCacheSize := calculateSize(s.feedbackCache.Cache)
 	positiveFeedbackCacheSize := calculateSize(s.feedbackCache.PositiveCache)
 
 	// 添加内存缓存
-	s.cacheLock.RLock()
 	popularItemsSize := calculateSize(s.popularItems)
 	latestItemsSize := calculateSize(s.latestItems)
 	itemNeighborsSize := calculateSize(s.itemNeighbors)
 	userNeighborsSize := calculateSize(s.userNeighbors)
-	s.cacheLock.RUnlock()
 
 	const bytesToMB = 1024 * 1024 // 1 MB = 1024 * 1024 bytes
 	// const bytesToMB = 1 // 1 MB = 1024 * 1024 bytes

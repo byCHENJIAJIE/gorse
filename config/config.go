@@ -90,13 +90,15 @@ type MasterConfig struct {
 
 // ServerConfig is the configuration for the server.
 type ServerConfig struct {
-	APIKey         string        `mapstructure:"api_key"`                      // default number of returned items
-	DefaultN       int           `mapstructure:"default_n" validate:"gt=0"`    // secret key for RESTful APIs (SSL required)
-	ClockError     time.Duration `mapstructure:"clock_error" validate:"gte=0"` // clock error in the cluster in seconds
-	AutoInsertUser bool          `mapstructure:"auto_insert_user"`             // insert new users while inserting feedback
-	AutoInsertItem bool          `mapstructure:"auto_insert_item"`             // insert new items while inserting feedback
-	CacheExpire    time.Duration `mapstructure:"cache_expire" validate:"gt=0"` // server-side cache expire time
-	NumJobs        int           `mapstructure:"n_jobs" validate:"gt=0"`       // number of working jobs
+	APIKey        			string        `mapstructure:"api_key"`                      // default number of returned items
+	DefaultN      			int           `mapstructure:"default_n" validate:"gt=0"`    // secret key for RESTful APIs (SSL required)
+	ClockError    			time.Duration `mapstructure:"clock_error" validate:"gte=0"` // clock error in the cluster in seconds
+	AutoInsertUser			bool          `mapstructure:"auto_insert_user"`             // insert new users while inserting feedback
+	AutoInsertItem			bool          `mapstructure:"auto_insert_item"`             // insert new items while inserting feedback
+	CacheExpire   			time.Duration `mapstructure:"cache_expire" validate:"gt=0"` // server-side cache expire time
+	NumJobs       			int           `mapstructure:"n_jobs" validate:"gt=0"`       // number of working jobs
+	FeedbackMaxCost 		int           `mapstructure:"feedback_max_cost" validate:"gte=0"` // max cost of feedback cache
+	PositiveFeedbackMaxCost int           `mapstructure:"positive_feedback_max_cost" validate:"gte=0"` // max cost of positive feedback cache
 }
 
 // RecommendConfig is the configuration of recommendation setup.
