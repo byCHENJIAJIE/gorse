@@ -18,12 +18,16 @@ import (
 	"database/sql"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/juju/errors"
 	"github.com/samber/lo"
 	"github.com/zhenghaoz/gorse/base/log"
+	"go.uber.org/zap/zapcore"
 	"gorm.io/gorm"
+
+	"gorm.io/gorm/logger"
 	"gorm.io/gorm/schema"
 	"moul.io/zapgorm2"
 )
@@ -127,8 +131,20 @@ func (tp TablePrefix) Key(key string) string {
 }
 
 func NewGORMConfig(tablePrefix string) *gorm.Config {
+	gormLogger := zapgorm2.New(log.Logger())
+	if log.Logger().Level() == zapcore.DebugLevel {
+		// Debug 模式：打印所有 SQL
+		gormLogger.LogLevel = logger.Info
+		gormLogger.SlowThreshold = 0
+	} else {
+		// 非 Debug 模式：只打印错误
+		gormLogger.LogLevel = logger.Error          // 只打印错误日志
+		gormLogger.SlowThreshold = time.Second      // 只打印超过1秒的慢查询
+		gormLogger.IgnoreRecordNotFoundError = true // 忽略记录未找到的错误
+	}
+
 	return &gorm.Config{
-		Logger:                 zapgorm2.New(log.Logger()),
+		Logger:                 gormLogger,
 		CreateBatchSize:        1000,
 		SkipDefaultTransaction: true,
 		NamingStrategy: schema.NamingStrategy{
