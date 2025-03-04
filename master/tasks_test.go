@@ -81,7 +81,7 @@ func (s *MasterTestSuite) TestFindItemNeighborsBruteForce() {
 	}
 
 	// load mock dataset
-	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
+	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, /*NewOnlineEvaluator()*/)
 	s.NoError(err)
 	s.rankingTrainSet = dataset
 
@@ -186,7 +186,7 @@ func (s *MasterTestSuite) TestFindItemNeighborsIVF() {
 	}
 
 	// load mock dataset
-	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
+	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, /*NewOnlineEvaluator()*/)
 	s.NoError(err)
 	s.rankingTrainSet = dataset
 
@@ -253,7 +253,7 @@ func (s *MasterTestSuite) TestFindItemNeighborsIVF_ZeroIDF() {
 		{FeedbackKey: data.FeedbackKey{FeedbackType: "FeedbackType", UserId: "0", ItemId: "1"}},
 	}, true, true, true)
 	s.NoError(err)
-	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
+	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, /*NewOnlineEvaluator()*/)
 	s.NoError(err)
 	s.rankingTrainSet = dataset
 
@@ -313,7 +313,7 @@ func (s *MasterTestSuite) TestFindUserNeighborsBruteForce() {
 	s.NoError(err)
 	err = s.DataClient.BatchInsertFeedback(ctx, feedbacks, true, true, true)
 	s.NoError(err)
-	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
+	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, /*NewOnlineEvaluator()*/)
 	s.NoError(err)
 	s.rankingTrainSet = dataset
 
@@ -393,7 +393,7 @@ func (s *MasterTestSuite) TestFindUserNeighborsIVF() {
 	s.NoError(err)
 	err = s.DataClient.BatchInsertFeedback(ctx, feedbacks, true, true, true)
 	s.NoError(err)
-	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
+	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, /*NewOnlineEvaluator()*/)
 	s.NoError(err)
 	s.rankingTrainSet = dataset
 
@@ -452,7 +452,7 @@ func (s *MasterTestSuite) TestFindUserNeighborsIVF_ZeroIDF() {
 		{FeedbackKey: data.FeedbackKey{FeedbackType: "FeedbackType", UserId: "1", ItemId: "0"}},
 	}, true, true, true)
 	s.NoError(err)
-	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, NewOnlineEvaluator())
+	dataset, _, _, _, err := s.LoadDataFromDatabase(context.Background(), s.DataClient, []string{"FeedbackType"}, nil, 0, 0, /*NewOnlineEvaluator()*/)
 	s.NoError(err)
 	s.rankingTrainSet = dataset
 

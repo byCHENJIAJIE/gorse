@@ -79,13 +79,13 @@ func (m *Master) runLoadDatasetTask() error {
 		zap.Strings("read_feedback_types", m.Config.Recommend.DataSource.ReadFeedbackTypes),
 		zap.Uint("item_ttl", m.Config.Recommend.DataSource.ItemTTL),
 		zap.Uint("feedback_ttl", m.Config.Recommend.DataSource.PositiveFeedbackTTL))
-	evaluator := NewOnlineEvaluator()
+	// evaluator := NewOnlineEvaluator()
 	rankingDataset, clickDataset, latestItems, popularItems, err := m.LoadDataFromDatabase(ctx, m.DataClient,
 		m.Config.Recommend.DataSource.PositiveFeedbackTypes,
 		m.Config.Recommend.DataSource.ReadFeedbackTypes,
 		m.Config.Recommend.DataSource.ItemTTL,
 		m.Config.Recommend.DataSource.PositiveFeedbackTTL,
-		evaluator)
+		/*evaluator*/)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -143,11 +143,12 @@ func (m *Master) runLoadDatasetTask() error {
 		log.Logger().Error("failed to write number of negative feedbacks", zap.Error(err))
 	}
 
+	// 修改为每天凌晨一点计算，不然每次LoadDatasetTask都会计算，数据会变化
 	// evaluate positive feedback rate
-	points := evaluator.Evaluate()
-	if err = m.CacheClient.AddTimeSeriesPoints(ctx, points); err != nil {
-		log.Logger().Error("failed to insert measurement", zap.Error(err))
-	}
+	// points := evaluator.Evaluate()
+	// if err = m.CacheClient.AddTimeSeriesPoints(ctx, points); err != nil {
+	// 	log.Logger().Error("failed to insert measurement", zap.Error(err))
+	// }
 
 	// collect active users and items
 	activeUsers, activeItems, inactiveUsers, inactiveItems := 0, 0, 0, 0
@@ -1401,7 +1402,7 @@ func (t *CacheGarbageCollectionTask) run(ctx context.Context, j *task.JobsAlloca
 }
 
 // LoadDataFromDatabase loads dataset from data store.
-func (m *Master) LoadDataFromDatabase(ctx context.Context, database data.Database, posFeedbackTypes, readTypes []string, itemTTL, positiveFeedbackTTL uint, evaluator *OnlineEvaluator) (
+func (m *Master) LoadDataFromDatabase(ctx context.Context, database data.Database, posFeedbackTypes, readTypes []string, itemTTL, positiveFeedbackTTL uint/*, evaluator *OnlineEvaluator*/) (
 	rankingDataset *ranking.DataSet, clickDataset *click.Dataset, latestItems *cache.DocumentAggregator, popularItems *cache.DocumentAggregator, err error) {
 	newCtx, span := progress.Start(ctx, "LoadDataFromDatabase", 4)
 	defer span.End()
@@ -1592,7 +1593,7 @@ func (m *Master) LoadDataFromDatabase(ctx context.Context, database data.Databas
 					popularCount[itemIndex]++
 				}
 				// insert feedback to evaluator
-				evaluator.Positive(f.FeedbackType, userIndex, itemIndex, f.Timestamp)
+				// evaluator.Positive(f.FeedbackType, userIndex, itemIndex, f.Timestamp)
 				mu.Unlock()
 			}
 		}
@@ -1642,7 +1643,7 @@ func (m *Master) LoadDataFromDatabase(ctx context.Context, database data.Databas
 
 				mu.Lock()
 				negativeFeedbackCount++
-				evaluator.Read(userIndex, itemIndex, f.Timestamp)
+				// evaluator.Read(userIndex, itemIndex, f.Timestamp)
 				mu.Unlock()
 			}
 		}
