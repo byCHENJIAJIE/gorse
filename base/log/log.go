@@ -85,7 +85,9 @@ func SetLogger(flagSet *pflag.FlagSet, debug bool) {
 		encoder = zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig())
 		level = zap.DebugLevel
 	} else {
-		encoder = zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig())
+		config := zap.NewProductionEncoderConfig()
+		config.EncodeTime = zapcore.TimeEncoderOfLayout("2006-01-02 15:04:05.000")
+		encoder = zapcore.NewJSONEncoder(config)
 		level = zap.InfoLevel
 	}
 	// create lumberjack logger
