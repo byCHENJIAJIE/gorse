@@ -335,7 +335,15 @@ func (c *DailyFeedbackRateCollector) Start() {
 		now := time.Now()
 		nextRun := time.Date(now.Year(), now.Month(), now.Day()+1, 1, 0, 0, 0, now.Location())
 		log.Logger().Info("collect daily rate, first run time", zap.Time("next_run", nextRun))
-		time.Sleep(nextRun.Sub(now))
+		// 先等待到首次运行时间
+        time.Sleep(nextRun.Sub(now))
+        
+        // 立即执行一次
+        if err := c.CollectDailyRate(); err != nil {
+            log.Logger().Error("failed to collect feedback rate", zap.Error(err))
+        }
+
+        // 然后开始定时执行
 
 		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()
