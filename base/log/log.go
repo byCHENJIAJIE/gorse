@@ -80,18 +80,22 @@ func SetLogger(flagSet *pflag.FlagSet, debug bool) {
 	var (
 		encoder zapcore.Encoder
 		level   zapcore.LevelEnabler
+		writers []zapcore.WriteSyncer
 	)
 	if debug {
 		encoder = zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig())
 		level = zap.DebugLevel
+		// 输出到控制台
+		writers = []zapcore.WriteSyncer{zapcore.AddSync(os.Stdout)}
 	} else {
 		config := zap.NewProductionEncoderConfig()
 		config.EncodeTime = zapcore.TimeEncoderOfLayout("2006-01-02 15:04:05.000")
 		encoder = zapcore.NewJSONEncoder(config)
 		level = zap.InfoLevel
+		// 输出到文件
+		writers = []zapcore.WriteSyncer{}
 	}
 	// create lumberjack logger
-	writers := []zapcore.WriteSyncer{zapcore.AddSync(os.Stdout)}
 	if flagSet.Changed("log-path") {
 		path, _ := flagSet.GetString("log-path")
 		maxSize, _ := flagSet.GetInt("log-max-size")
