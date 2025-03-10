@@ -3041,13 +3041,27 @@ func (s *RestServer) periodicCacheUpdate(ctx context.Context) {
 
 // 获取热门物品
 func (s *RestServer) GetPopularItems(category string) []cache.Document {
-	items, _ := s.popularItems.Load(category)
+	items, exists := s.popularItems.Load(category)
+    if !exists || items == nil {
+        log.Logger().Warn("popular items is nil or not exists",
+            zap.String("category", category),
+            zap.Bool("exists", exists),
+            zap.Bool("is_nil", items == nil))
+        return []cache.Document{}
+    }
 	return items.([]cache.Document)
 }
 
 // 获取最新物品
 func (s *RestServer) GetLatestItems(category string) []cache.Document {
-	items, _ := s.latestItems.Load(category)
+	items, exists := s.latestItems.Load(category)
+    if !exists || items == nil {
+        log.Logger().Warn("latest items is nil or not exists",
+            zap.String("category", category),
+            zap.Bool("exists", exists),
+            zap.Bool("is_nil", items == nil))
+        return []cache.Document{}
+    }
 	return items.([]cache.Document)
 }
 
