@@ -250,6 +250,9 @@ func (m *Master) Serve() {
 	// 启动正反馈率收集器
     collector := NewDailyFeedbackRateCollector(context.Background(), m.DataClient, m.CacheClient, m.Config)
     collector.Start()
+	// 启动反馈清理器
+	// cleaner := NewFeedbackCleaner(context.Background(), m.DataClient, m.Config)
+	// cleaner.Start()
 
 	// start rpc server
 	go func() {

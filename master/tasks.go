@@ -1732,3 +1732,73 @@ func (m *Master) LoadDataFromDatabase(ctx context.Context, database data.Databas
 
 	return rankingDataset, clickDataset, latestItems, popularItems, nil
 }
+
+// // FeedbackCleaner 清理正反馈
+// type FeedbackCleaner struct {
+// 	ctx         context.Context
+// 	dataClient  data.Database
+// 	config      *config.Config
+// }
+
+// func NewFeedbackCleaner(ctx context.Context, dataClient data.Database,
+// 	config *config.Config) *FeedbackCleaner {
+// 	return &FeedbackCleaner{
+// 		ctx:         ctx,
+// 		dataClient:  dataClient,
+// 		config:      config,
+// 	}
+// }
+
+// func (c *FeedbackCleaner) Start() {
+// 	go func() {
+// 		// 立即执行一次
+// 		if err := c.CleanFeedback(); err != nil {
+// 			log.Logger().Error("failed to clean feedback", zap.Error(err))
+// 		}
+
+
+// 		// 计算首次运行时间：下一个凌晨1点
+// 		now := time.Now()
+// 		nextRun := time.Date(now.Year(), now.Month(), now.Day()+1, 1, 0, 0, 0, now.Location())
+// 		log.Logger().Info("clean feedback, first run time", zap.Time("next_run", nextRun))
+// 		// 先等待到首次运行时间
+//         time.Sleep(nextRun.Sub(now))
+        
+//         // 立即执行一次
+//         if err := c.CleanFeedback(); err != nil {
+//             log.Logger().Error("failed to clean feedback", zap.Error(err))
+//         }
+
+//         // 然后开始定时执行
+// 		ticker := time.NewTicker(24 * time.Hour)
+// 		defer ticker.Stop()
+
+// 		for {
+// 			select {
+// 			case <-ticker.C:
+// 				if err := c.CleanFeedback(); err != nil {
+// 					log.Logger().Error("failed to clean feedback", zap.Error(err))
+// 				}
+// 			case <-c.ctx.Done():
+// 				return
+// 			}
+// 		}
+// 	}()
+// }
+
+// func (c *FeedbackCleaner) CleanFeedback() error {
+// 	if c.config.Recommend.DataSource.FeedbackTTL == 0 {
+// 		return nil
+// 	}
+//     // 读取配置，当前时间n天前的时间
+// 	beforeTime := time.Now().AddDate(0, 0, -int(c.config.Recommend.DataSource.FeedbackTTL))
+// 	log.Logger().Info("clean feedback", zap.Time("before_time", beforeTime))
+    
+//     err := c.dataClient.DeleteFeedback(c.ctx, nil, &beforeTime)
+//     if err != nil {
+//         log.Logger().Error("failed to clean feedback", zap.Error(err))
+//         return errors.Trace(err)
+//     }
+
+//     return nil
+// }
