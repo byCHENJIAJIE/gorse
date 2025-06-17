@@ -102,6 +102,7 @@ func (s *RestServer) SetServer(server *Server) {
 
 // StartHttpServer starts the REST-ful API server.
 func (s *RestServer) StartHttpServer(container *restful.Container) {
+	// master是不要执行这些缓存操作，这是推荐接口使用的，推荐接口依赖server模块(s.Server)，master目前没有
 	if !s.IsMaster {
 		// 初始化 itemCache 和 feedbackCache
 		if err := s.initItemCache(context.Background()); err != nil {
@@ -1020,6 +1021,7 @@ func (s *RestServer) RecommendOnline(ctx *recommendContext) error {
 			}
 			// FIXME 这里很花时间，有上百毫秒，瓶颈在这里
 			for _, user := range similarUsers {
+				startTime := time.Now()
 				// load similar user's historical feedback
 				similarUserFeedbacks, err := s.feedbackCache.GetUserPositiveFeedback(ctx.context, user.Id)
 				if err != nil {
@@ -1034,6 +1036,7 @@ func (s *RestServer) RecommendOnline(ctx *recommendContext) error {
 						scores[f.ItemId] += user.Score
 					}
 				}
+				log.Logger().Debug("TimeUse: load similar user feedback", zap.String("user_id", userId), zap.Duration("load_similar_user_feedback_time", time.Since(startTime)))
 			}
 			// collect top k
 			filters := make(map[string]*heap.TopKFilter[string, float64])
@@ -1175,6 +1178,10 @@ func (s *RestServer) RecommendOnline(ctx *recommendContext) error {
 	// explore latest and popular
 	exploreStart := time.Now()
 	for category, result := range results {
+		// 不是请求的category，则跳过
+		if !funk.ContainsString(ctx.categories, category) {
+			continue
+		}
 		// 每个category只需要w.Config.Recommend.CacheSize个items
 		if len(result) > s.Config.Recommend.CacheSize {
 			result = result[:s.Config.Recommend.CacheSize]
@@ -1184,6 +1191,8 @@ func (s *RestServer) RecommendOnline(ctx *recommendContext) error {
 			log.Logger().Error("failed to explore latest and popular items", zap.Error(err))
 			return errors.Trace(err)
 		}
+
+		log.Logger().Debug("ctx.excludeSet", zap.Any("ctx.excludeSet", ctx.excludeSet))
 
 		for _, item := range scores {
 			if !ctx.excludeSet.Contains(item.Id) {
@@ -1722,10 +1731,11 @@ func (s *RestServer) RecommendOffline(ctx *recommendContext) error {
 			return errors.Trace(err)
 		}
 		for _, item := range recommendation {
-			if !ctx.excludeSet.Contains(item.Id) {
+			// 兜底不需要去掉曝光过的内容
+			// if !ctx.excludeSet.Contains(item.Id) {
 				ctx.results = append(ctx.results, item.Id)
-				ctx.excludeSet.Add(item.Id)
-			}
+				// ctx.excludeSet.Add(item.Id)
+			// }
 		}
 		ctx.loadOfflineRecTime = time.Since(start)
 		ctx.numFromOffline = len(ctx.results) - ctx.numPrevStage
@@ -1742,10 +1752,11 @@ func (s *RestServer) RecommendCollaborative(ctx *recommendContext) error {
 			return errors.Trace(err)
 		}
 		for _, item := range collaborativeRecommendation {
-			if !ctx.excludeSet.Contains(item.Id) {
+			// 兜底不需要去掉曝光过的内容
+			// if !ctx.excludeSet.Contains(item.Id) {
 				ctx.results = append(ctx.results, item.Id)
-				ctx.excludeSet.Add(item.Id)
-			}
+				// ctx.excludeSet.Add(item.Id)
+			// }
 		}
 		ctx.loadColRecTime = time.Since(start)
 		ctx.numFromCollaborative = len(ctx.results) - ctx.numPrevStage
@@ -1759,27 +1770,26 @@ func (s *RestServer) RecommendUserBased(ctx *recommendContext) error {
 		start := time.Now()
 		candidates := make(map[string]float64)
 		// load similar users
-		similarUsers, err := s.CacheClient.SearchDocuments(ctx.context, cache.UserNeighbors, ctx.userId, []string{""}, 0, s.Config.Recommend.CacheSize)
+		similarUsers, err := s.GetUserNeighbors(ctx.userId)
 		if err != nil {
 			return errors.Trace(err)
 		}
 		for _, user := range similarUsers {
 			// load historical feedback
-			feedbacks, err := s.DataClient.GetUserFeedback(ctx.context, user.Id, s.Config.Now(), s.Config.Recommend.DataSource.PositiveFeedbackTypes...)
+			feedbacks, err := s.feedbackCache.GetUserPositiveFeedback(ctx.context, user.Id)
 			if err != nil {
 				return errors.Trace(err)
 			}
 			// add unseen items
 			for _, feedback := range feedbacks {
-				if !ctx.excludeSet.Contains(feedback.ItemId) {
-					item, err := s.DataClient.GetItem(ctx.context, feedback.ItemId)
-					if err != nil {
-						return errors.Trace(err)
-					}
-					if funk.Equal(ctx.categories, []string{""}) || funk.Subset(ctx.categories, item.Categories) {
+				// 兜底不需要去掉曝光过的内容
+				// if !ctx.excludeSet.Contains(feedback.ItemId) {
+					for _, category := range s.itemCache.GetCategory(feedback.ItemId) {
+						if funk.Equal(ctx.categories, []string{""}) || funk.Subset(ctx.categories, category) {
 						candidates[feedback.ItemId] += user.Score
 					}
 				}
+				// }
 			}
 		}
 		// collect top k
@@ -1816,14 +1826,17 @@ func (s *RestServer) RecommendItemBased(ctx *recommendContext) error {
 		candidates := make(map[string]float64)
 		for _, feedback := range userFeedback {
 			// load similar items
-			similarItems, err := s.CacheClient.SearchDocuments(ctx.context, cache.ItemNeighbors, feedback.ItemId, ctx.categories, 0, s.Config.Recommend.CacheSize)
+			for _, category := range ctx.categories {
+				similarItems, err := s.GetItemNeighbors(feedback.ItemId, category)
 			if err != nil {
 				return errors.Trace(err)
 			}
 			// add unseen items
 			for _, item := range similarItems {
-				if !ctx.excludeSet.Contains(item.Id) {
+					// 兜底不需要去掉曝光过的内容
+					// if !ctx.excludeSet.Contains(item.Id) {
 					candidates[item.Id] += item.Score
+					// }
 				}
 			}
 		}
@@ -1846,14 +1859,14 @@ func (s *RestServer) RecommendItemBased(ctx *recommendContext) error {
 func (s *RestServer) RecommendLatest(ctx *recommendContext) error {
 	if len(ctx.results) < ctx.n {
 		start := time.Now()
-		items, err := s.CacheClient.SearchDocuments(ctx.context, cache.LatestItems, "", ctx.categories, 0, s.Config.Recommend.CacheSize)
-		if err != nil {
-			return errors.Trace(err)
-		}
+		for _, category := range ctx.categories {
+			items := s.GetLatestItems(category)
 		for _, item := range items {
-			if !ctx.excludeSet.Contains(item.Id) {
+				// 兜底不需要去掉曝光过的内容
+				// if !ctx.excludeSet.Contains(item.Id) {
 				ctx.results = append(ctx.results, item.Id)
-				ctx.excludeSet.Add(item.Id)
+					// ctx.excludeSet.Add(item.Id)
+				// }
 			}
 		}
 		ctx.loadLatestTime = time.Since(start)
@@ -1866,14 +1879,14 @@ func (s *RestServer) RecommendLatest(ctx *recommendContext) error {
 func (s *RestServer) RecommendPopular(ctx *recommendContext) error {
 	if len(ctx.results) < ctx.n {
 		start := time.Now()
-		items, err := s.CacheClient.SearchDocuments(ctx.context, cache.PopularItems, "", ctx.categories, 0, s.Config.Recommend.CacheSize)
-		if err != nil {
-			return errors.Trace(err)
-		}
+		for _, category := range ctx.categories {
+			items := s.GetPopularItems(category)
 		for _, item := range items {
-			if !ctx.excludeSet.Contains(item.Id) {
+				// 兜底不需要去掉曝光过的内容
+				// if !ctx.excludeSet.Contains(item.Id) {
 				ctx.results = append(ctx.results, item.Id)
-				ctx.excludeSet.Add(item.Id)
+					// ctx.excludeSet.Add(item.Id)
+				// }
 			}
 		}
 		ctx.loadPopularTime = time.Since(start)
@@ -3067,7 +3080,7 @@ func (s *RestServer) GetLatestItems(category string) []cache.Document {
 
 // 获取物品邻居
 func (s *RestServer) GetItemNeighbors(itemId string, category string) ([]cache.Document, error) {
-	items, _ := s.itemNeighbors.Load(itemId)
+	items, _ := s.itemNeighbors.Load(itemId + category)
 	if items != nil {
 		return items.([]cache.Document), nil
 	}
@@ -3083,7 +3096,8 @@ func (s *RestServer) GetItemNeighbors(itemId string, category string) ([]cache.D
 	}
 
 	// 写入缓存
-	s.itemNeighbors.Store(itemId, newItems)
+	// 使用 itemId + category 作为 key
+	s.itemNeighbors.Store(itemId + category, newItems)
 
 	return newItems, nil
 }
