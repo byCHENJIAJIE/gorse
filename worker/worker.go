@@ -461,6 +461,7 @@ func (w *Worker) Recommend(users []data.User) {
 		zap.Int("cache_size", w.Config.Recommend.CacheSize))
 
 	// pull items from database
+	startPullItems := time.Now()
 	itemCache, itemCategories, err := w.pullItems(ctx)
 	if err != nil {
 		log.Logger().Error("failed to pull items", zap.Error(err))
@@ -468,7 +469,7 @@ func (w *Worker) Recommend(users []data.User) {
 	}
 	MemoryInuseBytesVec.WithLabelValues("item_cache").Set(float64(itemCache.Bytes()))
 	defer MemoryInuseBytesVec.WithLabelValues("item_cache").Set(0)
-
+	log.Logger().Debug("TimeUse, Pull items time", zap.Duration("duration", time.Since(startPullItems)))
 	// progress tracker
 	completed := make(chan struct{}, 1000)
 	_, span := w.tracer.Start(context.Background(), "Offline Recommend ("+w.workerName+")", len(users))
@@ -513,6 +514,7 @@ func (w *Worker) Recommend(users []data.User) {
 	if w.RankingModel != nil && !w.RankingModel.Invalid() && w.rankingIndex == nil {
 		if w.Config.Recommend.Collaborative.EnableIndex {
 			startTime := time.Now()
+			buildIndexTime := time.Now()
 			log.Logger().Info("start building ranking index")
 			itemIndex := w.RankingModel.GetItemIndex()
 			vectors := make([]search.Vector, itemIndex.Len())
@@ -534,6 +536,7 @@ func (w *Worker) Recommend(users []data.User) {
 			}
 			log.Logger().Info("complete building ranking index",
 				zap.Duration("build_time", time.Since(startTime)))
+			log.Logger().Debug("TimeUse, Build index time", zap.Duration("duration", time.Since(buildIndexTime)))
 		} else {
 			CollaborativeFilteringIndexRecall.Set(1)
 		}
@@ -553,18 +556,24 @@ func (w *Worker) Recommend(users []data.User) {
 	userFeedbackCache := NewFeedbackCache(w, w.Config.Recommend.DataSource.PositiveFeedbackTypes...)
 	defer MemoryInuseBytesVec.WithLabelValues("user_feedback_cache").Set(0)
 	err = parallel.Parallel(len(users), w.jobs, func(workerId, jobId int) error {
+		userRecommendTime := time.Now()
 		defer func() {
 			completed <- struct{}{}
+			log.Logger().Debug("TimeUse, Recommend time", zap.String("user_id", users[jobId].UserId), zap.Duration("duration", time.Since(userRecommendTime)))
 		}()
 		user := users[jobId]
 		userId := user.UserId
+		// FIXME 为什么这里计算这么慢
 		// skip inactive users before max recommend period
+		checkUserActiveTime := time.Now()
 		if !w.checkUserActiveTime(ctx, userId) || !w.checkRecommendCacheTimeout(ctx, userId, itemCategories) {
 			return nil
 		}
 		updateUserCount.Add(1)
+		log.Logger().Debug("TimeUse, Check user active time", zap.Duration("duration", time.Since(checkUserActiveTime)))
 
 		// load historical items
+		loadUserHistoricalItemsTime := time.Now()
 		historyItems, feedbacks, err := w.loadUserHistoricalItems(w.DataClient, userId)
 		excludeSet := mapset.NewSet(historyItems...)
 		if err != nil {
@@ -572,8 +581,10 @@ func (w *Worker) Recommend(users []data.User) {
 				zap.String("user_id", userId), zap.Error(err))
 			return errors.Trace(err)
 		}
+		log.Logger().Debug("TimeUse, Load user historical items time", zap.Duration("duration", time.Since(loadUserHistoricalItemsTime)))
 
 		// load positive items
+		loadUserFeedbackTime := time.Now()
 		var positiveItems []string
 		if w.Config.Recommend.Offline.EnableItemBasedRecommend {
 			positiveItems, err = userFeedbackCache.GetUserFeedback(ctx, userId)
@@ -584,6 +595,7 @@ func (w *Worker) Recommend(users []data.User) {
 			}
 			MemoryInuseBytesVec.WithLabelValues("user_feedback_cache").Set(float64(userFeedbackCache.Bytes()))
 		}
+		log.Logger().Debug("TimeUse, Load user feedback time", zap.Duration("duration", time.Since(loadUserFeedbackTime)))
 
 		// create candidates container
 		candidates := make(map[string][][]string)
@@ -593,6 +605,7 @@ func (w *Worker) Recommend(users []data.User) {
 		}
 
 		// Recommender #1: collaborative filtering.
+		collaborativeRecommendTime := time.Now()
 		collaborativeUsed := false
 		if w.Config.Recommend.Offline.EnableColRecommend && w.RankingModel != nil && !w.RankingModel.Invalid() {
 			if userIndex := w.RankingModel.GetUserIndex().ToNumber(userId); w.RankingModel.IsUserPredictable(userIndex) {
@@ -609,6 +622,7 @@ func (w *Worker) Recommend(users []data.User) {
 					return errors.Trace(err)
 				}
 				for category, items := range recommend {
+					log.Logger().Debug("ItemCount, Collaborative filtering recommend items", zap.String("category", category), zap.Int("items", len(items)))
 					candidates[category] = append(candidates[category], items)
 				}
 				collaborativeUsed = true
@@ -619,21 +633,29 @@ func (w *Worker) Recommend(users []data.User) {
 		} else if w.RankingModel == nil || w.RankingModel.Invalid() {
 			log.Logger().Debug("no collaborative filtering model")
 		}
+		log.Logger().Debug("TimeUse, Collaborative filtering recommend time", zap.Duration("duration", time.Since(collaborativeRecommendTime)))
 
 		// Recommender #2: item-based.
+		itemBasedRecommendTime := time.Now()
 		itemNeighborDigests := mapset.NewSet[string]()
 		if w.Config.Recommend.Offline.EnableItemBasedRecommend {
 			localStartTime := time.Now()
 			for _, category := range append([]string{""}, itemCategories...) {
 				// collect candidates
 				scores := make(map[string]float64)
+				// FIXME 这里的positiveItems太多了，把用户所有的正反馈都加载了，应该只加载前n个
+				log.Logger().Debug("ItemCount, Item-based recommend positiveItems", zap.String("category", category), zap.Int("positiveItems", len(positiveItems)))
 				for _, itemId := range positiveItems {
 					// load similar items
+					startTime := time.Now()
+					// fixme 太慢了mongo和redis每搜索一次都需要1-2ms
 					similarItems, err := w.CacheClient.SearchDocuments(ctx, cache.ItemNeighbors, itemId, []string{category}, 0, w.Config.Recommend.CacheSize)
 					if err != nil {
 						log.Logger().Error("failed to load similar items", zap.Error(err))
 						return errors.Trace(err)
 					}
+					log.Logger().Debug("ItemCount, Item-based recommend similarItems", zap.String("category", category), zap.String("itemId", itemId), zap.Int("similarItems", len(similarItems)))
+					log.Logger().Debug("TimeUse, SearchDocuments time", zap.Duration("duration", time.Since(startTime)))
 					// add unseen items
 					for _, item := range similarItems {
 						if !excludeSet.Contains(item.Id) && itemCache.IsAvailable(item.Id) {
@@ -641,6 +663,7 @@ func (w *Worker) Recommend(users []data.User) {
 						}
 					}
 					// load item neighbors digest
+					startTime = time.Now()
 					digest, err := w.CacheClient.Get(ctx, cache.Key(cache.ItemNeighborsDigest, itemId)).String()
 					if err != nil {
 						if !errors.Is(err, errors.NotFound) {
@@ -648,20 +671,27 @@ func (w *Worker) Recommend(users []data.User) {
 							return errors.Trace(err)
 						}
 					}
+					log.Logger().Debug("TimeUse, Get item neighbors digest time", zap.Duration("duration", time.Since(startTime)))
 					itemNeighborDigests.Add(digest)
 				}
 				// collect top k
+				startTime = time.Now()
 				filter := heap.NewTopKFilter[string, float64](w.Config.Recommend.CacheSize)
+				log.Logger().Debug("ItemCount, Item-based recommend scores", zap.String("category", category), zap.Int("scores", len(scores)))
 				for id, score := range scores {
 					filter.Push(id, score)
 				}
 				ids, _ := filter.PopAll()
+				log.Logger().Debug("ItemCount, Item-based recommend items", zap.String("category", category), zap.Int("items", len(ids)))
 				candidates[category] = append(candidates[category], ids)
+				log.Logger().Debug("TimeUse, PopAll time", zap.Duration("duration", time.Since(startTime)))
 			}
 			itemBasedRecommendSeconds.Add(time.Since(localStartTime).Seconds())
 		}
+		log.Logger().Debug("TimeUse, Item-based recommend time", zap.Duration("duration", time.Since(itemBasedRecommendTime)))
 
 		// Recommender #3: insert user-based items
+		userBasedRecommendTime := time.Now()
 		userNeighborDigests := mapset.NewSet[string]()
 		if w.Config.Recommend.Offline.EnableUserBasedRecommend {
 			localStartTime := time.Now()
@@ -711,12 +741,15 @@ func (w *Worker) Recommend(users []data.User) {
 			}
 			for category, filter := range filters {
 				ids, _ := filter.PopAll()
+				log.Logger().Debug("ItemCount, User-based recommend items", zap.String("category", category), zap.Int("items", len(ids)))
 				candidates[category] = append(candidates[category], ids)
 			}
 			userBasedRecommendSeconds.Add(time.Since(localStartTime).Seconds())
 		}
+		log.Logger().Debug("TimeUse, User-based recommend time", zap.Duration("duration", time.Since(userBasedRecommendTime)))
 
 		// Recommender #4: latest items.
+		latestRecommendTime := time.Now()
 		if w.Config.Recommend.Offline.EnableLatestRecommend {
 			localStartTime := time.Now()
 			for _, category := range append([]string{""}, itemCategories...) {
@@ -731,12 +764,15 @@ func (w *Worker) Recommend(users []data.User) {
 						recommend = append(recommend, latestItem.Id)
 					}
 				}
+				log.Logger().Debug("ItemCount, Latest recommend items", zap.String("category", category), zap.Int("items", len(recommend)))
 				candidates[category] = append(candidates[category], recommend)
 			}
 			latestRecommendSeconds.Add(time.Since(localStartTime).Seconds())
 		}
+		log.Logger().Debug("TimeUse, Latest recommend time", zap.Duration("duration", time.Since(latestRecommendTime)))
 
 		// Recommender #5: popular items.
+		popularRecommendTime := time.Now()
 		if w.Config.Recommend.Offline.EnablePopularRecommend {
 			localStartTime := time.Now()
 			for _, category := range append([]string{""}, itemCategories...) {
@@ -751,15 +787,18 @@ func (w *Worker) Recommend(users []data.User) {
 						recommend = append(recommend, popularItem.Id)
 					}
 				}
+				log.Logger().Debug("ItemCount, Popular recommend items", zap.String("category", category), zap.Int("items", len(recommend)))
 				candidates[category] = append(candidates[category], recommend)
 			}
 			popularRecommendSeconds.Add(time.Since(localStartTime).Seconds())
 		}
+		log.Logger().Debug("TimeUse, Popular recommend time", zap.Duration("duration", time.Since(popularRecommendTime)))
 
 		// rank items from different recommenders
 		// 1. If click-through rate prediction model is available, use it to rank items.
 		// 2. If collaborative filtering model is available, use it to rank items.
 		// 3. Otherwise, merge all recommenders' results randomly.
+		ctrRankTime := time.Now()
 		ctrUsed := false
 		results := make(map[string][]cache.Document)
 		for category, catCandidates := range candidates {
@@ -781,19 +820,34 @@ func (w *Worker) Recommend(users []data.User) {
 				results[category] = w.mergeAndShuffle(catCandidates)
 			}
 		}
+		// 打印result里每个category的items数量
+		for category, result := range results {
+			log.Logger().Debug("ItemCount, CTR ranking items", zap.String("category", category), zap.Int("items", len(result)))
+		}
+		log.Logger().Debug("TimeUse, CTR ranking time", zap.Duration("duration", time.Since(ctrRankTime)))
 
 		// replacement
+		replacementTime := time.Now()
 		if w.Config.Recommend.Replacement.EnableReplacement {
 			if results, err = w.replacement(results, &user, feedbacks, itemCache); err != nil {
 				log.Logger().Error("failed to replace items", zap.Error(err))
 				return errors.Trace(err)
 			}
 		}
+		for category, result := range results {
+			log.Logger().Debug("ItemCount, Replacement items", zap.String("category", category), zap.Int("items", len(result)))
+		}
+		log.Logger().Debug("TimeUse, Replacement time", zap.Duration("duration", time.Since(replacementTime)))
 
 		// explore latest and popular
+		exploreTime := time.Now()
 		recommendTime := time.Now()
 		aggregator := cache.NewDocumentAggregator(recommendTime)
 		for category, result := range results {
+			// 每个category只需要w.Config.Recommend.CacheSize个items
+			if len(result) > w.Config.Recommend.CacheSize {
+				result = result[:w.Config.Recommend.CacheSize]
+			}
 			scores, err := w.exploreRecommend(result, excludeSet, category)
 			if err != nil {
 				log.Logger().Error("failed to explore latest and popular items", zap.Error(err))
@@ -805,6 +859,12 @@ func (w *Worker) Recommend(users []data.User) {
 				return document.Score
 			}))
 		}
+		log.Logger().Debug("TimeUse, Explore latest and popular time", zap.Duration("duration", time.Since(exploreTime)))
+
+		// cache result
+		// FIXME：最终插入了几千个文档，没有必要吧？
+		cacheTime := time.Now()
+		log.Logger().Debug("TimeUse, aggregator length", zap.String("user_id", userId), zap.Int("aggregator", len(aggregator.ToSlice())))
 		if err = w.CacheClient.AddDocuments(ctx, cache.OfflineRecommend, userId, aggregator.ToSlice()); err != nil {
 			log.Logger().Error("failed to cache recommendation", zap.Error(err))
 			return errors.Trace(err)
@@ -820,6 +880,7 @@ func (w *Worker) Recommend(users []data.User) {
 			))); err != nil {
 			log.Logger().Error("failed to cache recommendation time", zap.Error(err))
 		}
+		log.Logger().Debug("TimeUse, Cache time", zap.Duration("duration", time.Since(cacheTime)))
 		return nil
 	})
 	close(completed)
@@ -839,7 +900,7 @@ func (w *Worker) Recommend(users []data.User) {
 }
 
 func (w *Worker) collaborativeRecommendBruteForce(userId string, itemCategories []string, excludeSet mapset.Set[string], itemCache *ItemCache) (map[string][]string, time.Duration, error) {
-	ctx := context.Background()
+	// ctx := context.Background()
 	userIndex := w.RankingModel.GetUserIndex().ToNumber(userId)
 	itemIds := w.RankingModel.GetItemIndex().GetNames()
 	localStartTime := time.Now()
@@ -859,53 +920,57 @@ func (w *Worker) collaborativeRecommendBruteForce(userId string, itemCategories 
 	}
 	// save result
 	recommend := make(map[string][]string)
-	aggregator := cache.NewDocumentAggregator(localStartTime)
+	// aggregator := cache.NewDocumentAggregator(localStartTime)
 	for category, recItemsFilter := range recItemsFilters {
-		recommendItems, recommendScores := recItemsFilter.PopAll()
+		// recommendItems, recommendScores := recItemsFilter.PopAll()
+		recommendItems, _ := recItemsFilter.PopAll()
 		recommend[category] = recommendItems
-		aggregator.Add(category, recommendItems, recommendScores)
+		// aggregator.Add(category, recommendItems, recommendScores)
 	}
-	if err := w.CacheClient.AddDocuments(ctx, cache.CollaborativeRecommend, userId, aggregator.ToSlice()); err != nil {
-		log.Logger().Error("failed to cache collaborative filtering recommendation result", zap.String("user_id", userId), zap.Error(err))
-		return nil, 0, errors.Trace(err)
-	}
-	if err := w.CacheClient.DeleteDocuments(ctx, []string{cache.CollaborativeRecommend}, cache.DocumentCondition{Before: &localStartTime}); err != nil {
-		log.Logger().Error("failed to delete stale collaborative filtering recommendation result", zap.String("user_id", userId), zap.Error(err))
-		return nil, 0, errors.Trace(err)
-	}
+	// if err := w.CacheClient.AddDocuments(ctx, cache.CollaborativeRecommend, userId, aggregator.ToSlice()); err != nil {
+	// 	log.Logger().Error("failed to cache collaborative filtering recommendation result", zap.String("user_id", userId), zap.Error(err))
+	// 	return nil, 0, errors.Trace(err)
+	// }
+	// if err := w.CacheClient.DeleteDocuments(ctx, []string{cache.CollaborativeRecommend}, cache.DocumentCondition{Before: &localStartTime}); err != nil {
+	// 	log.Logger().Error("failed to delete stale collaborative filtering recommendation result", zap.String("user_id", userId), zap.Error(err))
+	// 	return nil, 0, errors.Trace(err)
+	// }
 	return recommend, time.Since(localStartTime), nil
 }
 
 func (w *Worker) collaborativeRecommendHNSW(rankingIndex *search.HNSW, userId string, itemCategories []string, excludeSet mapset.Set[string], itemCache *ItemCache) (map[string][]string, time.Duration, error) {
-	ctx := context.Background()
+	// ctx := context.Background()
 	userIndex := w.RankingModel.GetUserIndex().ToNumber(userId)
 	localStartTime := time.Now()
-	values, scores := rankingIndex.MultiSearch(search.NewDenseVector(w.RankingModel.GetUserFactor(userIndex), nil, false),
+	values, _ := rankingIndex.MultiSearch(search.NewDenseVector(w.RankingModel.GetUserFactor(userIndex), nil, false),
 		itemCategories, w.Config.Recommend.CacheSize+excludeSet.Cardinality(), false)
+	// values, scores := rankingIndex.MultiSearch(search.NewDenseVector(w.RankingModel.GetUserFactor(userIndex), nil, false),
+	// 	itemCategories, w.Config.Recommend.CacheSize+excludeSet.Cardinality(), false)
 	// save result
 	recommend := make(map[string][]string)
-	aggregator := cache.NewDocumentAggregator(localStartTime)
+	// aggregator := cache.NewDocumentAggregator(localStartTime)
 	for category, catValues := range values {
 		recommendItems := make([]string, 0, len(catValues))
-		recommendScores := make([]float64, 0, len(catValues))
+		// recommendScores := make([]float64, 0, len(catValues))
 		for i := range catValues {
 			itemId := w.RankingModel.GetItemIndex().ToName(catValues[i])
 			if !excludeSet.Contains(itemId) && itemCache.IsAvailable(itemId) {
 				recommendItems = append(recommendItems, itemId)
-				recommendScores = append(recommendScores, float64(scores[category][i]))
+				// recommendScores = append(recommendScores, float64(scores[category][i]))
 			}
 		}
 		recommend[category] = recommendItems
-		aggregator.Add(category, recommendItems, recommendScores)
+		// aggregator.Add(category, recommendItems, recommendScores)
 	}
-	if err := w.CacheClient.AddDocuments(ctx, cache.CollaborativeRecommend, userId, aggregator.ToSlice()); err != nil {
-		log.Logger().Error("failed to cache collaborative filtering recommendation result", zap.String("user_id", userId), zap.Error(err))
-		return nil, 0, errors.Trace(err)
-	}
-	if err := w.CacheClient.DeleteDocuments(ctx, []string{cache.CollaborativeRecommend}, cache.DocumentCondition{Before: &localStartTime}); err != nil {
-		log.Logger().Error("failed to delete stale collaborative filtering recommendation result", zap.String("user_id", userId), zap.Error(err))
-		return nil, 0, errors.Trace(err)
-	}
+	// FIXME：不需要写入到缓存
+	// if err := w.CacheClient.AddDocuments(ctx, cache.CollaborativeRecommend, userId, aggregator.ToSlice()); err != nil {
+	// 	log.Logger().Error("failed to cache collaborative filtering recommendation result", zap.String("user_id", userId), zap.Error(err))
+	// 	return nil, 0, errors.Trace(err)
+	// }
+	// if err := w.CacheClient.DeleteDocuments(ctx, []string{cache.CollaborativeRecommend}, cache.DocumentCondition{Before: &localStartTime}); err != nil {
+	// 	log.Logger().Error("failed to delete stale collaborative filtering recommendation result", zap.String("user_id", userId), zap.Error(err))
+	// 	return nil, 0, errors.Trace(err)
+	// }
 	return recommend, time.Since(localStartTime), nil
 }
 
