@@ -375,7 +375,7 @@ func (c *DailyFeedbackRateCollector) CollectDailyRate() error {
     feedbackChan, errChan := c.dataClient.GetFeedbackStream(c.ctx, batchSize, 
         data.WithBeginTime(startTime), 
         data.WithEndTime(endTime), 
-        data.WithFeedbackTypes("read"))
+        data.WithFeedbackTypes(c.config.Recommend.DataSource.ReadFeedbackTypes...))
     
     // 处理阅读数据流
     for feedbacks := range feedbackChan {
