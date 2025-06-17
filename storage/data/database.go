@@ -244,6 +244,7 @@ type Database interface {
 	GetUserStream(ctx context.Context, batchSize int) (chan []User, chan error)
 	GetItemStream(ctx context.Context, batchSize int, timeLimit *time.Time) (chan []Item, chan error)
 	GetFeedbackStream(ctx context.Context, batchSize int, options ...ScanOption) (chan []Feedback, chan error)
+	DeleteFeedback(ctx context.Context, beginTime, endTime *time.Time, feedbackTypes ...string) error
 }
 
 // Open a connection to a database.

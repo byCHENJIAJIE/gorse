@@ -730,6 +730,17 @@ func (d *SQLDatabase) GetFeedback(ctx context.Context, cursor string, n int, beg
 	return "", feedbacks, nil
 }
 
+// DeleteFeedback deletes feedback from MySQL.
+func (d *SQLDatabase) DeleteFeedback(ctx context.Context, beginTime, endTime *time.Time, feedbackTypes ...string) error {
+	tx := d.gormDB.WithContext(ctx).Table(d.FeedbackTable()).
+		Where("time_stamp >= ? AND time_stamp <= ?", d.convertTimeZone(beginTime), d.convertTimeZone(endTime))
+	if len(feedbackTypes) > 0 {
+		tx.Where("feedback_type IN ?", feedbackTypes)
+	}
+	_, err := tx.Delete(&Feedback{}).Rows()
+	return errors.Trace(err)
+}
+
 // GetFeedbackStream reads feedback by stream.
 func (d *SQLDatabase) GetFeedbackStream(ctx context.Context, batchSize int, scanOptions ...ScanOption) (chan []Feedback, chan error) {
 	scan := NewScanOptions(scanOptions...)

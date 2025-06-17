@@ -139,6 +139,11 @@ func (NoDatabase) GetFeedback(_ context.Context, _ string, _ int, _, _ *time.Tim
 	return "", nil, ErrNoDatabase
 }
 
+// DeleteFeedback method of NoDatabase returns ErrNoDatabase.
+func (NoDatabase) DeleteFeedback(_ context.Context, _, _ *time.Time, _ ...string) error {
+	return ErrNoDatabase
+}
+
 // GetFeedbackStream method of NoDatabase returns ErrNoDatabase.
 func (NoDatabase) GetFeedbackStream(_ context.Context, _ int, _ ...ScanOption) (chan []Feedback, chan error) {
 	feedbackChan := make(chan []Feedback, bufSize)

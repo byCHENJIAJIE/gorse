@@ -682,6 +682,29 @@ func (db *MongoDB) GetFeedback(ctx context.Context, cursor string, n int, beginT
 	return base64.StdEncoding.EncodeToString([]byte(cursor)), feedbacks, nil
 }
 
+// DeleteFeedback deletes feedback from MongoDB.
+func (db *MongoDB) DeleteFeedback(ctx context.Context, beginTime, endTime *time.Time, feedbackTypes ...string) error {
+	c := db.client.Database(db.dbName).Collection(db.FeedbackTable())
+	opt := options.Find()
+	opt.SetSort(bson.D{{"feedbackkey", 1}})
+	filter := make(bson.M)
+	// pass feedback type to filter
+	if len(feedbackTypes) > 0 {
+		filter["feedbackkey.feedbacktype"] = bson.M{"$in": feedbackTypes}
+	}
+	// pass time limit to filter
+	timestampConditions := bson.M{}
+	if beginTime != nil {
+		timestampConditions["$gt"] = *beginTime
+	}
+	if endTime != nil {
+		timestampConditions["$lte"] = *endTime
+	}
+	filter["timestamp"] = timestampConditions
+	_, err := c.DeleteMany(ctx, filter)
+	return errors.Trace(err)
+}
+
 // GetFeedbackStream reads feedback from MongoDB by stream.
 func (db *MongoDB) GetFeedbackStream(ctx context.Context, batchSize int, scanOptions ...ScanOption) (chan []Feedback, chan error) {
 	scan := NewScanOptions(scanOptions...)
