@@ -311,6 +311,7 @@ func (m *Master) RunPrivilegedTasksLoop() {
 		case <-m.importedChan.C:
 		}
 
+		log.Logger().Debug("start load dataset")
 		// download dataset
 		err = m.runLoadDatasetTask()
 		if err != nil {

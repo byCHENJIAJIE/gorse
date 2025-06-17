@@ -179,6 +179,7 @@ func (m *Master) runLoadDatasetTask() error {
 	// split ranking dataset
 	startTime := time.Now()
 	m.rankingDataMutex.Lock()
+	// FIXME 这里执行比较久，可以优化，或者加打印提示
 	m.rankingTrainSet, m.rankingTestSet = rankingDataset.Split(0, 0)
 	rankingDataset = nil
 	m.rankingDataMutex.Unlock()
@@ -189,6 +190,7 @@ func (m *Master) runLoadDatasetTask() error {
 	// split click dataset
 	startTime = time.Now()
 	m.clickDataMutex.Lock()
+	// FIXME 这里执行比较久，可以优化，或者加打印提示
 	m.clickTrainSet, m.clickTestSet = clickDataset.Split(0.2, 0)
 	clickDataset = nil
 	m.clickDataMutex.Unlock()
@@ -1334,6 +1336,9 @@ func (t *CacheGarbageCollectionTask) run(ctx context.Context, j *task.JobsAlloca
 	}
 
 	log.Logger().Info("start cache garbage collection")
+	// newCtx, span := t.tracer.Start(ctx, "Cache Garbage Collection", 1)
+	// defer span.End()
+
 	var scanCount, reclaimCount int
 	start := time.Now()
 	err := t.CacheClient.Scan(func(s string) error {

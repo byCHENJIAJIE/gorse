@@ -294,6 +294,7 @@ func (b *IVFBuilder) Build(recall float32, numEpoch int, prune0 bool) (idx *IVF,
 
 	buildTime := time.Since(start)
 	idx.numProbe = int(math32.Ceil(float32(b.k) / math32.Sqrt(float32(len(b.data)))))
+	log.Logger().Debug("build vector index", zap.Int("k", b.k), zap.Int("n_vectors", len(b.data)), zap.Int("num_probe", idx.numProbe))
 	for i := 0; i < numEpoch; i++ {
 		score = b.evaluate(idx, prune0)
 		log.Logger().Info("try to build vector index",
